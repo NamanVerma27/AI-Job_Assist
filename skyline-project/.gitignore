@@ -17,9 +17,17 @@ backend/.env
 frontend/.env
 frontend/.env.local
 
+# --- venv ---
+venv/
+skyline-project/venv
+backend/venv/
+skyline-project/backend/venv/
+AI-Job_Assist/skyline-project/venv
+
 # --- Python Backend ---
 backend/venv/
 backend/env/
+backend/__pycache__
 backend/__pycache__/
 *.py[cod]
 *$py.class
