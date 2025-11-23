@@ -1,42 +1,47 @@
-// frontend/src/components/Navbar.jsx
-
-import React from 'react';
-// Import NavLink instead of Link for active styling
-import { NavLink } from 'react-router-dom';
-
-const navLinks = [
-  { name: 'Dashboard', path: '/' },
-  { name: 'Job Aggregator', path: '/jobs' },
-  { name: 'Resume Generator', path: '/resume' },
-  { name: 'ATS Score Checker', path: '/ats' },
-  { name: 'Mock Practice', path: '/mock' }, // <--- Updated to point to /mock
-  { name: 'AI Assistant', path: '/assistant' },
-];
+import React, { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { FaUserCircle, FaBars } from 'react-icons/fa';
 
 function Navbar() {
-  // These are the base classes for every link
-  const baseLinkClasses = "text-gray-600 hover:text-indigo-600 font-medium transition-colors duration-200";
-  // These classes are ADDED only when the link is active
-  const activeLinkClasses = "text-indigo-600 border-b-2 border-indigo-600 pb-1";
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
 
   return (
-    <nav className="bg-white shadow-sm h-16 flex items-center justify-between px-8 flex-shrink-0">
-      <div className="text-2xl font-bold text-indigo-600">
-        Skyline
+    <nav className="bg-white shadow-sm border-b px-6 py-3 flex justify-between items-center z-50 relative">
+      {/* Logo */}
+      <div className="flex items-center gap-2">
+        <div className="bg-indigo-600 text-white font-bold text-xl p-2 rounded-lg">S</div>
+        <span className="text-xl font-bold text-gray-800 tracking-tight">Skyline</span>
       </div>
-      <div className="flex items-center space-x-8">
-        {navLinks.map((link) => (
-          <NavLink
-            key={link.name}
-            to={link.path}
-            // The className prop receives an object with { isActive }
-            className={({ isActive }) => 
-              `${baseLinkClasses} ${isActive ? activeLinkClasses : ''}`
-            }
-          >
-            {link.name}
-          </NavLink>
-        ))}
+
+      {/* Right Side: User Menu */}
+      <div className="relative">
+        <button 
+          onClick={() => setIsMenuOpen(!isMenuOpen)}
+          className="flex items-center gap-2 hover:bg-gray-100 p-2 rounded-lg transition"
+        >
+          <span className="text-sm font-medium text-gray-700 hidden md:block">Demo User</span>
+          <FaUserCircle className="text-2xl text-gray-500" />
+        </button>
+
+        {/* Dropdown */}
+        {isMenuOpen && (
+          <div className="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border py-2 animate-fade-in-down">
+            <Link 
+              to="/profile" 
+              onClick={() => setIsMenuOpen(false)}
+              className="block px-4 py-2 text-gray-700 hover:bg-indigo-50 hover:text-indigo-600"
+            >
+              My Profile
+            </Link>
+            <div className="border-t my-1"></div>
+            <button 
+              className="block w-full text-left px-4 py-2 text-red-600 hover:bg-red-50"
+              onClick={() => alert("Logout logic here")}
+            >
+              Sign Out
+            </button>
+          </div>
+        )}
       </div>
     </nav>
   );

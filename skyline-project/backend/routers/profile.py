@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List
 from backend.database import get_db
@@ -76,6 +76,25 @@ def update_profile(profile: schemas.UserProfileV2, db: Session = Depends(get_db)
 def get_resumes(db: Session = Depends(get_db)):
     user = get_current_user(db)
     return user.resumes
+
+@router.post("/resumes")
+async def add_resume(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    user = get_current_user(db)
+    
+    # In a real app, save 'file' to disk here. 
+    # For now, we simulate saving and just store the metadata.
+    fake_filepath = f"/uploads/{file.filename}" 
+    
+    new_resume = models.Resume(
+        user_id=user.id,
+        filename=file.filename,
+        filepath=fake_filepath,
+        parsing_status="parsed" # Assume success for now
+    )
+    db.add(new_resume)
+    db.commit()
+    db.refresh(new_resume)
+    return new_resume
 
 @router.put("/resumes/{resume_id}/primary")
 def set_primary_resume(resume_id: int, db: Session = Depends(get_db)):

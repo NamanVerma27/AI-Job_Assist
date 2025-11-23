@@ -14,6 +14,7 @@ import JobAggregator from './pages/JobAggregator';
 import ResumeGenerator from './pages/ResumeGenerator';
 import MockPractice from './pages/MockPractice'; // <--- NEW IMPORT
 import AtsChecker from './pages/AtsChecker'; // <--- NEW IMPORT
+import Profile from './pages/Profile'; // <--- IMPORTED PROFILE PAGE
 
 function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -53,6 +54,7 @@ function App() {
               <Route path="/resume" element={<ResumeGenerator />} />
               <Route path="/mock" element={<MockPractice />} /> {/* <--- NEW ROUTE */}
               <Route path="/ats" element={<AtsChecker />} /> {/* <--- NEW ROUTE */}
+              <Route path="/profile" element={<Profile />} /> {/* <--- PROFILE ROUTE */}
             </Routes>
           </main>
           <Footer />
