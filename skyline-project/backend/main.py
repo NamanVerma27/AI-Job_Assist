@@ -1,7 +1,10 @@
-from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.config import get_settings
 from backend.routers import ai, jobs, resume
+
+from dotenv import load_dotenv
+load_dotenv()
+from fastapi import FastAPI
 
 settings = get_settings()
 

@@ -1,126 +1,160 @@
 import logging
 import json
-import google.generativeai as genai
+import os
+from pathlib import Path
+from typing import Dict
+from dotenv import load_dotenv
+from openai import OpenAI
 from backend.config import get_settings
+
+# --- 1. FORCE LOAD .ENV FILE ---
+# This is the critical fix. It calculates the exact path to your .env file
+# relative to this script, ensuring it loads even if you run the server from the root.
+env_path = Path(__file__).resolve().parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-if settings.GEMINI_API_KEY:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
+# --- 2. CONFIGURATION ---
+# This uses the currently supported Groq model
+MODEL_NAME = "llama-3.1-8b-instant"
+
+# --- 3. INITIALIZE CLIENT ---
+_groq_api_key = os.environ.get("GROQ_API_KEY") or getattr(settings, "GROQ_API_KEY", None)
+client = None
+
+if _groq_api_key:
+    try:
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=_groq_api_key
+        )
+        # Print a clear success message to the terminal
+        print(f"✅ LLM Engine: Connected to Groq using model: {MODEL_NAME}")
+    except Exception as e:
+        print(f"❌ LLM Engine: Failed to initialize client: {e}")
+        client = None
+else:
+    print("⚠️ LLM Engine: No GROQ_API_KEY found. Running in MOCK MODE.")
+
 
 class LLMEngine:
     
     @staticmethod
-    def generate_resume(profile_data: dict, job_description: str, style: str = "modern") -> dict:
+    def generate_resume(profile_data: dict, job_description: str, style: str = "modern") -> Dict:
         """
-        Generates a resume and insights based on profile and JD.
-        Style arg determines the tone/structure.
+        Generates a resume based on profile, JD, and selected style.
+        Returns a dict with 'resume_markdown' and 'suggestions'.
         """
-        # 1. Check for API Key (Mock Mode)
-        if not settings.GEMINI_API_KEY:
+        # Check if client is active
+        if not client:
             return LLMEngine._get_mock_resume()
 
-        # 2. Construct Prompt with Style Injection
-        prompt = f"""
-        Act as an expert Resume Writer and Career Coach.
-        
-        REQUIRED STYLE: {style.upper()}
-        - If 'MODERN': Use concise, punchy sentences. Focus on metrics and results. Active voice.
-        - If 'PROFESSIONAL': Use formal language, traditional structure. Robust descriptions.
-        - If 'CREATIVE': Use engaging vocabulary, highlight personality and innovation.
-        - If 'ACADEMIC': Focus on education, research, detailed qualifications.
+        # System Prompt: Enforce JSON output
+        system_msg = (
+            "You are an expert Resume Writer. "
+            "Output strictly valid JSON. "
+            "Do not output markdown formatting (like ```json) around the response."
+        )
 
-        Task 1: Generate a professional resume in Markdown format tailored to the Job Description below.
-        Task 2: Provide 3 short, actionable tips to improve chances for this specific job.
+        # User Prompt: Inject Style, Profile, and JD
+        prompt = f"""
+        REQUIRED STYLE: {style.upper()}
+        - If 'MODERN': Concise, metric-heavy, active voice.
+        - If 'PROFESSIONAL': Formal, traditional structure.
+        - If 'CREATIVE': Engaging vocabulary, highlight personality.
+        - If 'ACADEMIC': Focus on research and detailed qualifications.
+
+        Task 1: Write a professional resume tailored to the JD.
+        Task 2: Provide 3 actionable tips.
 
         USER PROFILE:
-        {profile_data}
+        {json.dumps(profile_data)}
 
-        TARGET JOB DESCRIPTION:
+        JOB DESCRIPTION:
         {job_description}
 
-        Output Format (JSON):
+        OUTPUT SCHEMA (JSON ONLY):
         {{
-            "resume_markdown": "# Name...",
-            "suggestions": ["Tip 1", "Tip 2", "Tip 3"]
+          "resume_markdown": "# Name...",
+          "suggestions": ["Tip 1", "Tip 2", "Tip 3"]
         }}
         """
 
         try:
-            model = genai.GenerativeModel('gemini-pro')
-            response = model.generate_content(prompt)
-            # Simple cleanup to ensure we get JSON (Gemini sometimes adds backticks)
-            clean_text = response.text.replace("```json", "").replace("```", "")
-            return json.loads(clean_text)
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=2000,
+            )
+
+            content = response.choices[0].message.content
+            
+            # Clean formatting (remove code blocks if AI adds them)
+            clean_text = content.strip().replace("```json", "").replace("```", "").strip()
+            
+            # Attempt to parse JSON
+            try:
+                return json.loads(clean_text)
+            except json.JSONDecodeError:
+                # Fallback: Try to find the JSON object inside text
+                start = clean_text.find("{")
+                end = clean_text.rfind("}")
+                if start != -1 and end != -1:
+                    return json.loads(clean_text[start:end+1])
+                raise
+
         except Exception as e:
-            logger.error(f"LLM Error: {e}")
+            logger.error(f"LLM Generation Error: {e}")
             return LLMEngine._get_mock_resume()
 
     @staticmethod
     def generate_response(prompt: str, task_type: str = "chat", role: str = "General") -> str:
         """
-        Handles Chat and Mock Interview logic.
+        Handles general Chat and Mock Interview logic.
         """
-        # 1. Mock Mode Fallback
-        if not settings.GEMINI_API_KEY:
+        if not client:
             if task_type == "mock_interview":
-                return f"[DEMO MODE] That is a good answer! For a {role} role, you should also mention X. \n\nNext Question: Describe a challenging project you worked on."
-            return "I am currently running in **Demo Mode**. I can help you simulate an interview or discuss career strategies!"
+                return f"[DEMO] That's a good answer! (Mock Mode - API Key missing)"
+            return "I am currently in Demo Mode. Please configure your API key."
 
-        # 2. Live Gemini Mode
         try:
-            model = genai.GenerativeModel('gemini-pro')
+            system_msg = "You are a helpful career coach."
             
-            # Construct a specialized prompt based on task
             if task_type == "mock_interview":
-                system_instruction = f"""
-                You are an expert technical interviewer for the role of: {role}.
-                The user just gave an answer (or started the session).
-                
-                Your Goal:
-                1. Briefly evaluate the user's last answer (if any).
-                2. Ask the NEXT relevant interview question (technical or behavioral).
-                3. Keep it professional but encouraging.
-                4. Do not write long essays; keep it conversational.
+                system_msg = f"""
+                You are an expert interviewer for the role: {role}.
+                1. Briefly evaluate the user's answer.
+                2. Ask the NEXT relevant question.
+                3. Keep it conversational and short.
                 """
-                full_prompt = f"{system_instruction}\n\nUser Input: {prompt}"
-            else:
-                full_prompt = f"Act as a Career Coach. User: {prompt}"
 
-            response = model.generate_content(full_prompt)
-            return response.text
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=800,
+            )
+            return response.choices[0].message.content
+
         except Exception as e:
-            logger.error(f"LLM Error: {e}")
-            return "Error connecting to AI service."
+            logger.error(f"LLM Chat Error: {e}")
+            return "Sorry, I encountered an error connecting to the AI."
 
     @staticmethod
-    def _get_mock_resume() -> dict:
+    def _get_mock_resume() -> Dict:
         """
-        Fallback data for when keys are missing or API fails.
+        Fallback data when API is unavailable.
         """
         return {
-            "resume_markdown": """
-# JOHN DOE
-**Software Engineer**
-*City, State | email@example.com | (555) 123-4567*
-
-## PROFESSIONAL SUMMARY
-Results-oriented software developer with experience in Python and React. Passionate about building scalable web applications.
-
-## EXPERIENCE
-**Software Developer | Tech Solutions Inc.**
-*Jan 2022 - Present*
-- Developed REST APIs using FastAPI.
-- Improved frontend performance by 20% using React best practices.
-
-## SKILLS
-- **Languages:** Python, JavaScript, SQL
-- **Frameworks:** React, FastAPI, Django
-            """,
-            "suggestions": [
-                "Your profile lacks specific 'Cloud' experience mentioned in the JD.",
-                "Highlight your 'Team Leadership' skills more.",
-                "Add metrics to your project descriptions (e.g., 'Reduced latency by 15%')."
-            ]
+            "resume_markdown": "# Mock Resume\n\n**API Key missing or invalid.**\n\nPlease check your backend logs to see why the key wasn't loaded.",
+            "suggestions": ["Check .env file location", "Restart Uvicorn Server"]
         }

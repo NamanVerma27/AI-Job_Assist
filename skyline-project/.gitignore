@@ -10,6 +10,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Fix: Explicitly ignore the backend .env deep in the folder structure
+skyline-project/backend/.env
 backend/.env
 frontend/.env
 frontend/.env.local
@@ -32,9 +35,6 @@ frontend/npm-debug.log
 frontend/yarn-error.log
 frontend/yarn.lock
 frontend/package-lock.json
-# (Note: Keep package-lock.json if you want to lock versions, 
-# but often it's ignored in simple projects. 
-# Usually, keep it. If you want to exclude it, uncomment the line above.)
 
 # --- Database ---
 *.sqlite3
