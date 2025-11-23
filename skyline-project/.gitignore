@@ -29,6 +29,7 @@ backend/venv/
 backend/env/
 backend/__pycache__
 backend/__pycache__/
+__pycache__/
 *.py[cod]
 *$py.class
 backend/.pytest_cache/
