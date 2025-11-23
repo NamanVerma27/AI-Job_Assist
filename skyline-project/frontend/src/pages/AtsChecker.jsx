@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { FaCheckCircle, FaExclamationTriangle, FaMagic } from 'react-icons/fa';
+import { FaCheckCircle, FaExclamationTriangle, FaMagic, FaFileAlt } from 'react-icons/fa';
 
 function AtsChecker() {
   const [step, setStep] = useState('input'); // input | loading | result
@@ -8,9 +8,39 @@ function AtsChecker() {
   const [jdText, setJdText] = useState('');
   const [report, setReport] = useState(null);
 
+  // New State for Saved Resumes
+  const [savedResumes, setSavedResumes] = useState([]);
+
+  // Fetch saved resumes on load
+  useEffect(() => {
+    const fetchResumes = async () => {
+      try {
+        const res = await axios.get('/api/profile/resumes');
+        // Expecting an array of ResumeMetadata objects
+        setSavedResumes(res.data || []);
+      } catch (err) {
+        console.error('Could not fetch saved resumes', err);
+      }
+    };
+    fetchResumes();
+  }, []);
+
+  const handleSelectResume = (e) => {
+    const resumeId = e.target.value;
+    if (!resumeId) return;
+
+    const selected = savedResumes.find((r) => r.id === parseInt(resumeId));
+    if (selected && selected.content) {
+      setResumeText(selected.content);
+    } else if (selected && !selected.content) {
+      // If the resume exists but has no extracted content, optionally fetch detail (not implemented)
+      alert('This saved resume has no extracted text available.');
+    }
+  };
+
   const handleAnalyze = async () => {
     if (!resumeText || !jdText) {
-      alert("Please provide both Resume text and Job Description.");
+      alert('Please provide both Resume text and Job Description.');
       return;
     }
 
@@ -18,21 +48,24 @@ function AtsChecker() {
     try {
       const res = await axios.post('/api/resume/ats-score', {
         resume_text: resumeText,
-        jd_text: jdText
+        jd_text: jdText,
       });
-      setReport(res.data.data);
+      // expecting response shape: { data: { ...report } } or { data } depending on backend
+      const payload = res.data?.data ?? res.data;
+      setReport(payload);
       setStep('result');
     } catch (err) {
-      alert("Analysis failed. Please try again.");
+      console.error('ATS analysis error', err);
+      alert('Analysis failed. Please try again.');
       setStep('input');
     }
   };
 
   // --- SCORE COLOR HELPER ---
   const getScoreColor = (score) => {
-    if (score >= 80) return "text-green-600 border-green-500 bg-green-50";
-    if (score >= 50) return "text-yellow-600 border-yellow-500 bg-yellow-50";
-    return "text-red-600 border-red-500 bg-red-50";
+    if (score >= 80) return 'text-green-600 border-green-500 bg-green-50';
+    if (score >= 50) return 'text-yellow-600 border-yellow-500 bg-yellow-50';
+    return 'text-red-600 border-red-500 bg-red-50';
   };
 
   return (
@@ -40,17 +73,40 @@ function AtsChecker() {
       <div className="max-w-5xl mx-auto">
         <h1 className="text-3xl font-bold text-gray-800 mb-2">ATS Score Checker</h1>
         <p className="text-gray-600 mb-8">
-          See how well your resume matches the job description using AI & Keyword analysis.
+          Compare your resume against a job description using AI analysis.
         </p>
 
         {step === 'input' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             {/* Input Resume */}
             <div className="bg-white p-6 rounded-lg shadow-sm border">
-              <h3 className="font-bold text-lg mb-3">1. Paste Resume Text</h3>
+              <div className="flex justify-between items-center mb-3">
+                <h3 className="font-bold text-lg">1. Resume Content</h3>
+
+                {/* DROPDOWN FOR SAVED RESUMES */}
+                {savedResumes.length > 0 && (
+                  <div className="relative">
+                    <select
+                      onChange={handleSelectResume}
+                      className="text-sm border-indigo-200 border rounded-lg px-3 py-1 bg-indigo-50 text-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      defaultValue=""
+                    >
+                      <option value="" disabled>
+                        Load Saved Resume...
+                      </option>
+                      {savedResumes.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.filename} {r.primary_flag ? ' (Primary)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
               <textarea
-                className="w-full h-64 p-3 border rounded focus:ring-2 focus:ring-indigo-500"
-                placeholder="Copy and paste your resume content here..."
+                className="w-full h-64 p-3 border rounded focus:ring-2 focus:ring-indigo-500 text-sm"
+                placeholder="Paste text or select a saved resume above..."
                 value={resumeText}
                 onChange={(e) => setResumeText(e.target.value)}
               ></textarea>
@@ -58,10 +114,10 @@ function AtsChecker() {
 
             {/* Input JD */}
             <div className="bg-white p-6 rounded-lg shadow-sm border">
-              <h3 className="font-bold text-lg mb-3">2. Paste Job Description</h3>
+              <h3 className="font-bold text-lg mb-3">2. Job Description</h3>
               <textarea
-                className="w-full h-64 p-3 border rounded focus:ring-2 focus:ring-indigo-500"
-                placeholder="Copy and paste the job description here..."
+                className="w-full h-64 p-3 border rounded focus:ring-2 focus:ring-indigo-500 text-sm"
+                placeholder="Paste the job description here..."
                 value={jdText}
                 onChange={(e) => setJdText(e.target.value)}
               ></textarea>
@@ -93,7 +149,11 @@ function AtsChecker() {
                 <h2 className="text-2xl font-bold text-gray-800">Overall Match Score</h2>
                 <p className="text-gray-500 mt-1">{report.summary}</p>
               </div>
-              <div className={`mt-4 md:mt-0 relative w-32 h-32 rounded-full border-4 flex items-center justify-center text-4xl font-bold ${getScoreColor(report.total_score)}`}>
+              <div
+                className={`mt-4 md:mt-0 relative w-32 h-32 rounded-full border-4 flex items-center justify-center text-4xl font-bold ${getScoreColor(
+                  report.total_score
+                )}`}
+              >
                 {report.total_score}%
               </div>
             </div>
@@ -105,7 +165,7 @@ function AtsChecker() {
                   <FaExclamationTriangle /> Missing Keywords
                 </h3>
                 <div className="flex flex-wrap gap-2">
-                  {report.missing_keywords.length > 0 ? (
+                  {report.missing_keywords && report.missing_keywords.length > 0 ? (
                     report.missing_keywords.map((word, i) => (
                       <span key={i} className="bg-red-50 text-red-700 px-3 py-1 rounded-full text-sm border border-red-200">
                         {word}
@@ -123,21 +183,22 @@ function AtsChecker() {
                   <FaMagic /> AI Recommendations
                 </h3>
                 <ul className="space-y-3">
-                  {report.improvements.map((tip, i) => (
-                    <li key={i} className="flex items-start gap-2 text-gray-700">
-                      <FaCheckCircle className="text-green-500 mt-1 flex-shrink-0" />
-                      {tip}
-                    </li>
-                  ))}
+                  {report.improvements && report.improvements.length > 0 ? (
+                    report.improvements.map((tip, i) => (
+                      <li key={i} className="flex items-start gap-2 text-gray-700">
+                        <FaCheckCircle className="text-green-500 mt-1 flex-shrink-0" />
+                        <span>{tip}</span>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="text-gray-600">No suggestions available.</li>
+                  )}
                 </ul>
               </div>
             </div>
 
             <div className="text-center">
-              <button
-                onClick={() => setStep('input')}
-                className="text-indigo-600 font-semibold hover:underline"
-              >
+              <button onClick={() => setStep('input')} className="text-indigo-600 font-semibold hover:underline">
                 Check Another Resume
               </button>
             </div>

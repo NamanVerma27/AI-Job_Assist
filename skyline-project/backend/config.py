@@ -7,11 +7,16 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     ENV: str = "development"
     
+    # Feature Flags
+    PROFILE_V2_ENABLED: bool = True # Toggle this to enable new DB logic
+
     # Security: Allow "*" (all) to fix Codespaces/Cloud connection issues
     CORS_ORIGINS: list = ["*"]
     
     # AI Keys (Leave empty to use Mock Mode)
+    # Supports both GROQ_API_KEY and GEMINI_API_KEY depending on engine usage
     GEMINI_API_KEY: str = "" 
+    GROQ_API_KEY: str = ""
 
     # Job API Keys
     ADZUNA_APP_ID: str = "e0878b4a"
@@ -19,6 +24,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore" # Ignore extra env vars to prevent validation errors
 
 @lru_cache()
 def get_settings():

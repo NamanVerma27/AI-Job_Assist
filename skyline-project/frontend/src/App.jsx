@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Routes, Route } from 'react-router-dom';
 import axios from 'axios';
+import { Toaster } from 'react-hot-toast';
 
 // Components
 import Sidebar from './components/Sidebar';
@@ -14,6 +15,7 @@ import JobAggregator from './pages/JobAggregator';
 import ResumeGenerator from './pages/ResumeGenerator';
 import MockPractice from './pages/MockPractice'; // <--- NEW IMPORT
 import AtsChecker from './pages/AtsChecker'; // <--- NEW IMPORT
+import Profile from './pages/Profile'; // <--- IMPORTED PROFILE PAGE
 
 function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -40,6 +42,7 @@ function App() {
 
   return (
     <div className="bg-gray-100 h-screen flex flex-col">
+      <Toaster position="top-right" />
       <Navbar />
       <div className="flex flex-1 overflow-hidden">
         {/* Pass userProfile to sidebar so it can display the name */}
@@ -53,6 +56,7 @@ function App() {
               <Route path="/resume" element={<ResumeGenerator />} />
               <Route path="/mock" element={<MockPractice />} /> {/* <--- NEW ROUTE */}
               <Route path="/ats" element={<AtsChecker />} /> {/* <--- NEW ROUTE */}
+              <Route path="/profile" element={<Profile />} /> {/* <--- PROFILE ROUTE */}
             </Routes>
           </main>
           <Footer />

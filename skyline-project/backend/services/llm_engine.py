@@ -1,160 +1,340 @@
-import logging
-import json
+# backend/services/llm_engine.py
+"""
+Deterministic rewrite for `rewrite_project`:
+- For task_type == "rewrite_project" we DO NOT call the LLM.
+- We synthesize a single past-tense action sentence from user input.
+- All other tasks still use Groq/Gemini fallback as before.
+"""
+
 import os
+import re
+import json
+import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
+import google.generativeai as genai
 from backend.config import get_settings
 
-# --- 1. FORCE LOAD .ENV FILE ---
-# This is the critical fix. It calculates the exact path to your .env file
-# relative to this script, ensuring it loads even if you run the server from the root.
-env_path = Path(__file__).resolve().parent.parent / '.env'
+# Load .env
+env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# --- 2. CONFIGURATION ---
-# This uses the currently supported Groq model
 MODEL_NAME = "llama-3.1-8b-instant"
 
-# --- 3. INITIALIZE CLIENT ---
+# Initialize Groq client if available
+client: Optional[OpenAI] = None
 _groq_api_key = os.environ.get("GROQ_API_KEY") or getattr(settings, "GROQ_API_KEY", None)
-client = None
-
 if _groq_api_key:
     try:
-        client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=_groq_api_key
-        )
-        # Print a clear success message to the terminal
-        print(f"✅ LLM Engine: Connected to Groq using model: {MODEL_NAME}")
+        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=_groq_api_key)
+        print(f"✅ LLM Engine: Connected to Groq ({MODEL_NAME})")
     except Exception as e:
-        print(f"❌ LLM Engine: Failed to initialize client: {e}")
+        logger.error(f"Groq Init Error: {e}", exc_info=True)
         client = None
-else:
-    print("⚠️ LLM Engine: No GROQ_API_KEY found. Running in MOCK MODE.")
+
+# Configure genai (non-fatal)
+if getattr(settings, "GEMINI_API_KEY", None):
+    try:
+        genai.configure(api_key=getattr(settings, "GEMINI_API_KEY"))
+    except Exception:
+        logger.debug("genai configure failed or not available.", exc_info=True)
 
 
 class LLMEngine:
-    
+    # ------------------------
+    # Utilities for deterministic synthesis
+    # ------------------------
     @staticmethod
-    def generate_resume(profile_data: dict, job_description: str, style: str = "modern") -> Dict:
+    def _enforce_word_limit(text: str, max_words: int = 35) -> str:
+        if not text:
+            return ""
+        parts = text.split()
+        return " ".join(parts[:max_words]) if len(parts) > max_words else text
+
+    @staticmethod
+    def _synthesize_from_input(user_input: str) -> str:
         """
-        Generates a resume based on profile, JD, and selected style.
-        Returns a dict with 'resume_markdown' and 'suggestions'.
+        Deterministic synthesis:
+        - Map common weak verbs to strong past-tense verbs (made->Developed, built->Built, fixed->Resolved).
+        - Remove leading pronouns.
+        - Construct: "<Verb> a/an <short noun phrase>." or "<Verb> <ACRONYM/...>."
         """
-        # Check if client is active
-        if not client:
-            return LLMEngine._get_mock_resume()
+        if not user_input or not user_input.strip():
+            return "Built project."
 
-        # System Prompt: Enforce JSON output
-        system_msg = (
-            "You are an expert Resume Writer. "
-            "Output strictly valid JSON. "
-            "Do not output markdown formatting (like ```json) around the response."
-        )
+        text = user_input.strip()
+        lc = text.lower()
 
-        # User Prompt: Inject Style, Profile, and JD
-        prompt = f"""
-        REQUIRED STYLE: {style.upper()}
-        - If 'MODERN': Concise, metric-heavy, active voice.
-        - If 'PROFESSIONAL': Formal, traditional structure.
-        - If 'CREATIVE': Engaging vocabulary, highlight personality.
-        - If 'ACADEMIC': Focus on research and detailed qualifications.
+        verb_map = {
+            "make": "Developed", "made": "Developed",
+            "build": "Built", "built": "Built",
+            "create": "Developed", "created": "Developed",
+            "implement": "Implemented", "implemented": "Implemented",
+            "write": "Implemented", "wrote": "Implemented",
+            "fix": "Resolved", "fixed": "Resolved",
+            "develop": "Developed", "developed": "Developed",
+            "design": "Designed", "designed": "Designed",
+            "deploy": "Deployed", "deployed": "Deployed",
+            "engineer": "Engineered", "engineered": "Engineered",
+            "launch": "Launched", "launched": "Launched",
+            "automate": "Automated", "automated": "Automated",
+        }
 
-        Task 1: Write a professional resume tailored to the JD.
-        Task 2: Provide 3 actionable tips.
+        # Remove leading pronouns like "i", "we"
+        lc = re.sub(r'^\s*(i am|i\'m|i|we|we\'re|we are)\s+', '', lc, flags=re.IGNORECASE).strip()
 
-        USER PROFILE:
-        {json.dumps(profile_data)}
+        # Try to capture first verb and rest
+        m = re.match(r'^(?P<v>[a-z]+)\s+(?P<rest>.+)$', lc)
+        verb_word = None
+        rest = lc
+        if m:
+            verb_word = m.group('v')
+            rest = m.group('rest').strip()
 
-        JOB DESCRIPTION:
-        {job_description}
+        chosen_verb = None
+        if verb_word and verb_word in verb_map:
+            chosen_verb = verb_map[verb_word]
+        else:
+            for k in verb_map.keys():
+                if re.search(r'\b' + re.escape(k) + r'\b', lc):
+                    chosen_verb = verb_map[k]
+                    break
 
-        OUTPUT SCHEMA (JSON ONLY):
-        {{
-          "resume_markdown": "# Name...",
-          "suggestions": ["Tip 1", "Tip 2", "Tip 3"]
-        }}
-        """
+        if not chosen_verb:
+            chosen_verb = "Built"
 
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=2000,
-            )
+        # Clean rest: remove leading articles
+        rest = re.sub(r'^\s*(a|an|the)\s+', '', rest, flags=re.IGNORECASE).strip()
+        rest_words = rest.split()
+        if len(rest_words) > 12:
+            rest = " ".join(rest_words[:12])
 
-            content = response.choices[0].message.content
-            
-            # Clean formatting (remove code blocks if AI adds them)
-            clean_text = content.strip().replace("```json", "").replace("```", "").strip()
-            
-            # Attempt to parse JSON
-            try:
-                return json.loads(clean_text)
-            except json.JSONDecodeError:
-                # Fallback: Try to find the JSON object inside text
-                start = clean_text.find("{")
-                end = clean_text.rfind("}")
-                if start != -1 and end != -1:
-                    return json.loads(clean_text[start:end+1])
-                raise
+        # Capitalize rest appropriately
+        if rest:
+            rest = rest[0].upper() + rest[1:] if rest[0].isalpha() else rest
+            # Choose article heuristics
+            if re.match(r'^[AEIOUaeiou]', rest):
+                sentence = f"{chosen_verb} an {rest}."
+            else:
+                if re.match(r'^[A-Z]{2,}\b', rest):
+                    sentence = f"{chosen_verb} {rest}."
+                else:
+                    sentence = f"{chosen_verb} a {rest}."
+        else:
+            sentence = f"{chosen_verb} project."
 
-        except Exception as e:
-            logger.error(f"LLM Generation Error: {e}")
-            return LLMEngine._get_mock_resume()
+        sentence = re.sub(r'\s+', ' ', sentence).strip()
+        if not re.search(r'[\.!?]$', sentence):
+            sentence = sentence.rstrip('.') + '.'
 
+        # Enforce word limit (default 35 words)
+        sentence = LLMEngine._enforce_word_limit(sentence, max_words=35)
+        if not re.search(r'[\.!?]$', sentence):
+            sentence = sentence.rstrip('.') + '.'
+        return sentence
+
+    # ------------------------
+    # Public API
+    # ------------------------
     @staticmethod
     def generate_response(prompt: str, task_type: str = "chat", role: str = "General") -> str:
         """
-        Handles general Chat and Mock Interview logic.
+        If task_type == 'rewrite_project' -> deterministic synthesis (no LLM calls).
+        Otherwise -> call LLM (Groq preferred) and return cleaned text.
         """
-        if not client:
-            if task_type == "mock_interview":
-                return f"[DEMO] That's a good answer! (Mock Mode - API Key missing)"
-            return "I am currently in Demo Mode. Please configure your API key."
+        gemini_key = getattr(settings, "GEMINI_API_KEY", None)
 
+        # If neither client present and task isn't rewrite_project, return demo
+        if task_type != "rewrite_project" and not client and not gemini_key:
+            return "Demo Mode: AI suggestions unavailable without key."
+
+        # Deterministic short rewrite (guaranteed)
+        if task_type == "rewrite_project":
+            return LLMEngine._synthesize_from_input(prompt)
+
+        # For other tasks, fallback to LLM call
         try:
-            system_msg = "You are a helpful career coach."
-            
-            if task_type == "mock_interview":
-                system_msg = f"""
-                You are an expert interviewer for the role: {role}.
-                1. Briefly evaluate the user's answer.
-                2. Ask the NEXT relevant question.
-                3. Keep it conversational and short.
-                """
+            if task_type == "refine_bio":
+                system_msg = "You are a Resume Editor. Reformat the bio to be professional , grammatical correct and confident. RULES: Max 40 words. NO markdown."
+            elif task_type == "improve_experience":
+                system_msg = "You are a Career Coach. Rewrite the input into a single powerful bullet point. RULES: Start with a strong Action Verb. Quantify results where possible. NO lists."
+            elif task_type == "mock_interview":
+                system_msg = f"You are a strict interviewer for a {role} role. Ask short, relevant questions."
+            elif task_type == "resume":
+                system_msg = "You are an expert Resume Writer. Output valid JSON only."
+            elif task_type == "reformat_description":
+                system_msg = (
+                    "You are a professional technical writer. Reformat the USER'S DESCRIPTION into a single clean formatted paragraph. "
+                    "Output ONLY the paragraph, nothing else especially no key points."
+                )
+            else:
+                system_msg = f"You are a helpful assistant. Role: {role}."
 
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=800,
-            )
-            return response.choices[0].message.content
+            messages = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": f"Input: {prompt}\nOutput:"}
+            ]
+
+            raw_text = ""
+
+            # Try Groq
+            if client:
+                try:
+                    resp = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=300
+                    )
+                    raw_text = resp.choices[0].message.content or ""
+                except Exception as e:
+                    logger.error(f"Groq generate_response error: {e}", exc_info=True)
+                    raw_text = ""
+
+            # Fallback to genai (best-effort)
+            if not raw_text and gemini_key:
+                try:
+                    model = genai.GenerativeModel("gemini-pro")
+                    full_prompt = f"{system_msg}\n\nInput: {prompt}\nOutput:"
+                    resp = model.generate_content(full_prompt)
+                    raw_text = getattr(resp, "text", "") or str(resp)
+                except Exception as e:
+                    logger.error(f"genai generate_response error: {e}", exc_info=True)
+                    raw_text = ""
+
+            # Simple cleaning for UI
+            if raw_text:
+                # remove code fences and markdown, trim
+                cleaned = re.sub(r"```.*?```", "", raw_text, flags=re.DOTALL)
+                cleaned = cleaned.replace("`", "").replace("**", "").replace("*", "").strip()
+                cleaned = re.sub(r"\r\n", "\n", cleaned)
+                cleaned = re.sub(r"\n{2,}", "\n\n", cleaned)
+                return cleaned.strip()
+
+            return "AI Service did not return a response."
 
         except Exception as e:
-            logger.error(f"LLM Chat Error: {e}")
-            return "Sorry, I encountered an error connecting to the AI."
+            logger.error(f"LLM Error in generate_response: {e}", exc_info=True)
+            return "AI Service Error."
+
+    @staticmethod
+    def generate_resume(profile_data: dict, job_description: str, style: str = "modern") -> Dict:
+        """
+        Resume generation (unchanged): Groq first, Gemini/OpenAI fallback, genai last.
+        """
+        gemini_key = getattr(settings, "GEMINI_API_KEY", None)
+        groq_env_key = os.environ.get("GROQ_API_KEY") or getattr(settings, "GROQ_API_KEY", None)
+
+        if not gemini_key and not groq_env_key:
+            return LLMEngine._get_mock_resume()
+
+        system_msg = (
+            "You are an expert Resume Writer. Output strictly valid JSON. "
+            "Do NOT include markdown formatting or code fences."
+        )
+
+        prompt = f"""
+REQUIRED STYLE: {style.upper()}
+- If 'MODERN': Concise, metric-heavy, active voice.
+- If 'PROFESSIONAL': Formal, traditional structure.
+- If 'CREATIVE': Engaging vocabulary, highlight personality.
+- If 'ACADEMIC': Focus on research and detailed qualifications.
+
+Task 1: Write a professional resume tailored to the JD.
+Task 2: Provide 3 actionable tips.
+
+USER PROFILE:
+{json.dumps(profile_data)}
+
+JOB DESCRIPTION:
+{job_description}
+
+OUTPUT SCHEMA (JSON ONLY):
+{{
+  "resume_markdown": "# Name...",
+  "suggestions": ["Tip 1", "Tip 2", "Tip 3"]
+}}
+"""
+
+        raw_text = ""
+
+        if client:
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=2000,
+                )
+                raw_text = response.choices[0].message.content or ""
+            except Exception as e:
+                logger.error(f"Groq error in generate_resume: {e}", exc_info=True)
+                raw_text = ""
+
+        if not raw_text and gemini_key:
+            try:
+                gemini_model = getattr(settings, "GEMINI_MODEL", "gpt-4o-mini")
+                temp_client = OpenAI(api_key=gemini_key)
+                response = temp_client.chat.completions.create(
+                    model=gemini_model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=2000,
+                )
+                raw_text = response.choices[0].message.content or ""
+            except Exception as e:
+                logger.error(f"Gemini/OpenAI fallback error in generate_resume: {e}", exc_info=True)
+                raw_text = ""
+
+        if not raw_text and getattr(settings, "GEMINI_API_KEY", None):
+            try:
+                full_prompt = f"{system_msg}\n\n{prompt}"
+                model = genai.GenerativeModel("gemini-pro")
+                genai_resp = model.generate_content(full_prompt)
+                raw_text = getattr(genai_resp, "text", None) or str(genai_resp)
+            except Exception:
+                logger.debug("genai fallback for resume failed or incompatible.", exc_info=True)
+
+        if not raw_text:
+            logger.error("No raw_text returned by any model in generate_resume; returning mock.")
+            return LLMEngine._get_mock_resume()
+
+        # Try parse JSON or extract {...} block
+        clean_text = re.sub(r"```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE).strip()
+        try:
+            parsed = json.loads(clean_text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            start = clean_text.find("{")
+            end = clean_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    candidate = clean_text[start:end+1]
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    logger.error("JSON parsing failed on extracted {...} block in generate_resume.", exc_info=True)
+
+        logger.error("Failed to parse JSON from model output in generate_resume.")
+        logger.debug(f"Model raw output (truncated): {clean_text[:4000]}")
+        return LLMEngine._get_mock_resume()
 
     @staticmethod
     def _get_mock_resume() -> Dict:
-        """
-        Fallback data when API is unavailable.
-        """
         return {
-            "resume_markdown": "# Mock Resume\n\n**API Key missing or invalid.**\n\nPlease check your backend logs to see why the key wasn't loaded.",
-            "suggestions": ["Check .env file location", "Restart Uvicorn Server"]
+            "resume_markdown": "# Mock Resume\n\nAI Service Unavailable.",
+            "suggestions": ["Check API Keys (GROQ_API_KEY, GEMINI_API_KEY)", "Restart your backend after setting keys"]
         }
