@@ -107,7 +107,8 @@ def _detect_date_gaps(text: str) -> Tuple[bool, List[str]]:
     Heuristic: find years and detect if there are large gaps between consecutive years mentioned.
     This is a weak heuristic but useful to raise a flag for manual review.
     """
-    years = [int(m.group(0)) for m in YEAR_RE.finditer(text)]
+    # FIX: Changed YEAR_RE to _YEAR_RE to match the variable defined above
+    years = [int(m.group(0)) for m in _YEAR_RE.finditer(text)]
     years = sorted(set(years))
     findings = []
     if len(years) >= 2:

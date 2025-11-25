@@ -2,13 +2,30 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List
 import io
+import os
+import pathlib
 import PyPDF2
 import docx
 
 from backend.database import get_db
 from backend import models, schemas
 from backend.config import get_settings
-from backend.services.text_cleaner import clean_text  # NEW import
+
+# New helper import: text cleaning utility
+try:
+    from backend.services.text_cleaner import clean_text
+except Exception:
+    # Fallback if text_cleaner not present (should not happen in normal flow)
+    def clean_text(x, redact=False):
+        return x or ""
+
+# Optional OCR support (used only when selectable text extraction is insufficient)
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
 router = APIRouter(prefix="/profile", tags=["Profile V2"])
 settings = get_settings()
@@ -84,53 +101,122 @@ def get_resumes(db: Session = Depends(get_db)):
 
 @router.post("/resumes", response_model=schemas.ResumeMetadata)
 async def add_resume(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Upload endpoint enhancements:
+    - Attempts to extract text from PDF/DOCX using PyPDF2/docx.
+    - If selectable text is insufficient and OCR libs are present, attempts OCR via pytesseract.
+    - Cleans text with clean_text before saving into DB.
+    - Saves uploaded file bytes to `backend/uploads/` (creates dir if missing).
+    - Sets parsing_status: "parsed", "parsed_via_ocr", or "failed".
+    """
     user = get_current_user(db)
-    
-    # 1. Parse the File Content
+
+    # Ensure uploads dir exists
+    uploads_dir = pathlib.Path(__file__).resolve().parents[1] / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
     content = ""
+    parsing_status = "pending"
+    saved_filepath = ""
+
     try:
         file_bytes = await file.read()
-        filename_lower = file.filename.lower()
+        filename = file.filename or "uploaded_resume"
+        filename_lower = filename.lower()
 
+        # Save the raw uploaded file to disk (safe default: overwrite if same name)
+        safe_filename = filename.replace(" ", "_")
+        saved_path = uploads_dir / safe_filename
+        with open(saved_path, "wb") as f:
+            f.write(file_bytes)
+        saved_filepath = str(saved_path)
+
+        # 1) Try PyPDF2 for PDF text extraction (fast)
         if filename_lower.endswith(".pdf"):
             try:
                 pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+                pages = []
                 for page in pdf_reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        content += text + "\n"
+                    try:
+                        text = page.extract_text() or ""
+                        pages.append(text)
+                    except Exception:
+                        # continue on page extraction failure
+                        continue
+                content = "\n\n".join(pages).strip()
             except Exception:
-                # Some PDFs may fail; fall back gracefully
-                content = "Could not parse text from PDF."
+                content = ""
+
+            # 2) If content too short and OCR available, perform OCR
+            if (not content or len(content.strip()) < 200) and OCR_AVAILABLE:
+                try:
+                    images = convert_from_bytes(file_bytes, dpi=200, fmt="jpeg")
+                    ocr_pages = []
+                    for img in images:
+                        try:
+                            txt = pytesseract.image_to_string(img, lang='eng')
+                        except Exception:
+                            txt = ""
+                        ocr_pages.append(txt)
+                    ocr_text = "\n\n".join(ocr_pages).strip()
+                    # Prefer OCR text if it's longer/more complete
+                    if ocr_text and len(ocr_text) > len(content or ""):
+                        content = ocr_text
+                        parsing_status = "parsed_via_ocr"
+                except Exception:
+                    # If OCR fails, leave content as-is (may be empty)
+                    parsing_status = parsing_status or "failed"
+            else:
+                # if PyPDF2 got reasonable text
+                if content and len(content.strip()) >= 200:
+                    parsing_status = "parsed"
+
         elif filename_lower.endswith(".docx"):
             try:
                 doc = docx.Document(io.BytesIO(file_bytes))
-                for para in doc.paragraphs:
-                    content += para.text + "\n"
+                paras = [para.text for para in doc.paragraphs]
+                content = "\n".join(paras).strip()
+                if content and len(content) >= 50:
+                    parsing_status = "parsed"
             except Exception:
-                content = "Could not parse text from DOCX."
+                content = ""
+                parsing_status = "failed"
         else:
-            content = "Could not parse text. Unsupported format."
-            
-    except Exception as e:
-        # Log the error server-side and set a friendly message in DB
-        print(f"Parsing error: {e}")
-        content = "Error parsing file."
+            # unsupported file types
+            content = ""
+            parsing_status = "failed"
 
-    # Clean content before saving (defensive)
-    cleaned = clean_text(content, redact=False)
+    except Exception as e:
+        # Log server-side for debugging
+        print(f"[add_resume] Parsing error: {e}")
+        content = ""
+        parsing_status = "failed"
+
+    # Final cleaning step (always run, even on OCR output)
+    try:
+        cleaned = clean_text(content, redact=False)
+    except Exception:
+        # Fallback: keep raw content if clean_text utility missing/throws
+        cleaned = content or ""
+
+    # Sanity check & final parsing_status adjustments
+    if not cleaned or len(cleaned.strip()) < 20:
+        parsing_status = "failed"
+    elif parsing_status == "pending":
+        parsing_status = "parsed"
 
     # 2. Save to Database
     new_resume = models.Resume(
         user_id=user.id,
-        filename=file.filename,
-        filepath=f"/uploads/{file.filename}",  # Placeholder path; replace with real storage in prod
-        parsing_status="parsed" if len(cleaned and cleaned.strip()) > 50 else "failed",
-        content=cleaned  # <--- Saving the extracted text
+        filename=filename,
+        filepath=saved_filepath or f"/uploads/{filename}",
+        parsing_status=parsing_status,
+        content=cleaned  # Save the extracted + cleaned text for downstream modules
     )
     db.add(new_resume)
     db.commit()
     db.refresh(new_resume)
+
     return new_resume
 
 @router.put("/resumes/{resume_id}/primary")
