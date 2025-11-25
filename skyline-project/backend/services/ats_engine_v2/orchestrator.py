@@ -1,15 +1,16 @@
+# backend/services/ats_engine_v2/orchestrator.py
 """
-backend/services/ats_engine_v2/orchestrator.py
+Improved ATS v2 Orchestrator
+Schema-aligned with the new test suite expectations.
 
-Production-ready orchestrator for ATS v2.
-
-Notes:
-- Defensively calls each module.
-- Normalizes weights and clamps final_score to 0-100.
-- Always includes safe minimal raw keys (total_keyword_score, breakdown, raw_counts, tiers_detected)
-  so tests and frontends won't KeyError when accessing expected fields.
-- export_raw config toggles returning full module outputs vs compact summary.
-- Adds meta. Version: 2.0
+Key Changes:
+- Adds a clean, stable `breakdown` object: {module: {score, weight}}
+- Ensures raw.keywords always has:
+    total_keyword_score, breakdown, raw_counts, tiers_detected
+- Ensures final_score = weighted sum of module scores
+- Keeps meta + insights + role exactly as required
+- Compact raw output by default (export_raw flag to get full outputs)
+- Version: 2.0
 """
 
 from typing import Dict, Any
@@ -22,13 +23,15 @@ from .tone_analyzer import analyze_tone
 from .role_detector import detect_role
 from .insights import generate_insights
 
+
 _DEFAULT_WEIGHTS = {
-    "structure": 0.2,
-    "keywords": 0.2,
-    "semantics": 0.2,
-    "readability": 0.2,
-    "tone": 0.2
+    "structure": 0.18,
+    "keywords": 0.30,
+    "semantics": 0.22,
+    "readability": 0.15,
+    "tone": 0.15
 }
+
 
 def _safe_call(func, *args, name: str = "module", default=None, **kwargs):
     """
@@ -41,85 +44,105 @@ def _safe_call(func, *args, name: str = "module", default=None, **kwargs):
         print(f"[ATS v2] {name} error:", e)
         return default if default is not None else {}
 
+
 def run_ats_v2(resume_text: str, jd_text: str) -> Dict[str, Any]:
     """
     Main entrypoint for ATS v2.
-    Returns dict:
-      - meta
-      - total_score
-      - scores (per module)
-      - role
-      - insights
-      - raw (either full or compact but always contains expected keys)
+
+    Returns improved schema:
+    {
+      "meta": {...},
+      "total_score": int,
+      "breakdown": { module: { score: int, weight: float } , ... },
+      "role": {...},
+      "insights": {...},
+      "raw": { "keywords": {...}, "structure": {...}, ... }
+    }
     """
 
     cfg = ATS_CONFIG or {}
-    enable_structure = cfg.get("enable_structure", True)
-    enable_keywords = cfg.get("enable_keywords", True)
-    enable_semantics = cfg.get("enable_semantics", True)
+    enable_structure   = cfg.get("enable_structure", True)
+    enable_keywords    = cfg.get("enable_keywords", True)
+    enable_semantics   = cfg.get("enable_semantics", True)
     enable_readability = cfg.get("enable_readability", True)
-    enable_tone = cfg.get("enable_tone", True)
-    enable_role_detection = cfg.get("enable_role_detection", True)
-    enable_insights = cfg.get("enable_insights", True)
-    export_raw = cfg.get("export_raw", False)  # set True for debugging; False in prod
+    enable_tone        = cfg.get("enable_tone", True)
+    enable_role        = cfg.get("enable_role_detection", True)
+    enable_insights    = cfg.get("enable_insights", True)
 
+    export_raw = cfg.get("export_raw", False)
     weights = cfg.get("weights", _DEFAULT_WEIGHTS)
 
     # -------------------------
-    # Run modules defensively
+    # Execute ATS modules (defensively)
     # -------------------------
-    structure_result = _safe_call(analyze_structure, resume_text, name="structure_analyzer", default={}) if enable_structure else {}
-    # analyze_keywords(jd_text, resume_text)
-    keyword_result = _safe_call(analyze_keywords, jd_text, resume_text, name="keyword_engine", default={}) if enable_keywords else {}
-    semantic_result = _safe_call(compute_semantic_similarity, resume_text, jd_text, name="semantic_engine", default={}) if enable_semantics else {}
-    readability_result = _safe_call(analyze_readability, resume_text, name="readability", default={}) if enable_readability else {}
-    tone_result = _safe_call(analyze_tone, resume_text, name="tone_analyzer", default={}) if enable_tone else {}
-    role_result = _safe_call(detect_role, resume_text, name="role_detector", default={}) if enable_role_detection else {}
+    structure_result = (
+        _safe_call(analyze_structure, resume_text, name="structure_analyzer", default={})
+        if enable_structure else {}
+    )
+
+    # IMPORTANT: analyze_keywords signature is (jd_text, resume_text)
+    keyword_result = (
+        _safe_call(analyze_keywords, jd_text, resume_text, name="keyword_engine", default={})
+        if enable_keywords else {}
+    )
+
+    semantic_result = (
+        _safe_call(compute_semantic_similarity, resume_text, jd_text, name="semantic_engine", default={})
+        if enable_semantics else {}
+    )
+
+    readability_result = (
+        _safe_call(analyze_readability, resume_text, name="readability", default={})
+        if enable_readability else {}
+    )
+
+    tone_result = (
+        _safe_call(analyze_tone, resume_text, name="tone_analyzer", default={})
+        if enable_tone else {}
+    )
+
+    role_result = (
+        _safe_call(detect_role, resume_text, name="role_detector", default={})
+        if enable_role else {}
+    )
 
     # -------------------------
-    # Normalize module scores (consistent keys)
+    # Normalize numeric scores (safe)
     # -------------------------
-    struct_s = structure_result.get("structure_score", structure_result.get("score", 0) or 0)
-    key_s = keyword_result.get("total_keyword_score", keyword_result.get("keyword_score", 0) or 0)
-    sem_s = semantic_result.get("semantic_score", semantic_result.get("score", 0) or 0)
-    read_s = readability_result.get("readability_score", readability_result.get("score", 0) or 0)
-    tone_s = tone_result.get("tone_score", tone_result.get("score", 0) or 0)
-
-    # Ensure numeric floats
-    def _to_float_safe(v):
+    def safe_num(value):
         try:
-            return float(v)
+            return float(value)
         except Exception:
             return 0.0
 
-    struct_s = _to_float_safe(struct_s)
-    key_s = _to_float_safe(key_s)
-    sem_s = _to_float_safe(sem_s)
-    read_s = _to_float_safe(read_s)
-    tone_s = _to_float_safe(tone_s)
+    struct_s = safe_num(structure_result.get("structure_score", structure_result.get("score", 0)))
+    key_s    = safe_num(keyword_result.get("total_keyword_score", keyword_result.get("keyword_score", 0)))
+    sem_s    = safe_num(semantic_result.get("semantic_score", semantic_result.get("score", 0)))
+    read_s   = safe_num(readability_result.get("readability_score", readability_result.get("score", 0)))
+    tone_s   = safe_num(tone_result.get("tone_score", tone_result.get("score", 0)))
 
     # -------------------------
-    # Weighted final score (normalize weights)
+    # Weighted final score
     # -------------------------
-    w_structure = weights.get("structure", _DEFAULT_WEIGHTS["structure"])
-    w_keywords = weights.get("keywords", _DEFAULT_WEIGHTS["keywords"])
-    w_semantics = weights.get("semantics", _DEFAULT_WEIGHTS["semantics"])
+    w_structure   = weights.get("structure",   _DEFAULT_WEIGHTS["structure"])
+    w_keywords    = weights.get("keywords",    _DEFAULT_WEIGHTS["keywords"])
+    w_semantics   = weights.get("semantics",   _DEFAULT_WEIGHTS["semantics"])
     w_readability = weights.get("readability", _DEFAULT_WEIGHTS["readability"])
-    w_tone = weights.get("tone", _DEFAULT_WEIGHTS["tone"])
+    w_tone        = weights.get("tone",        _DEFAULT_WEIGHTS["tone"])
 
-    w_sum = sum([w_structure, w_keywords, w_semantics, w_readability, w_tone])
-    if w_sum <= 0:
-        w_sum = 1.0
+    total_w = w_structure + w_keywords + w_semantics + w_readability + w_tone
+    if total_w <= 0:
+        total_w = 1.0
 
-    weighted_value = (
+    weighted_score = (
         struct_s * w_structure +
-        key_s * w_keywords +
-        sem_s * w_semantics +
-        read_s * w_readability +
-        tone_s * w_tone
-    ) / w_sum
+        key_s    * w_keywords +
+        sem_s    * w_semantics +
+        read_s   * w_readability +
+        tone_s   * w_tone
+    ) / total_w
 
-    final_score = int(round(max(0.0, min(100.0, weighted_value))))
+    final_score = int(round(max(0, min(100, weighted_score))))
 
     # -------------------------
     # Insights
@@ -132,52 +155,45 @@ def run_ats_v2(resume_text: str, jd_text: str) -> Dict[str, Any]:
         "tone": tone_result,
         "role": role_result
     }
-    insights = _safe_call(generate_insights, insights_input, name="generate_insights", default={}) if enable_insights else {}
+
+    insights = (
+        _safe_call(generate_insights, insights_input, name="generate_insights", default={})
+        if enable_insights else {}
+    )
 
     # -------------------------
-    # Raw keywords safe structure (always include expected keys)
+    # Construct improved breakdown
+    # -------------------------
+    breakdown = {
+        "structure":   {"score": int(round(struct_s)), "weight": float(w_structure)},
+        "keywords":    {"score": int(round(key_s)),    "weight": float(w_keywords)},
+        "semantics":   {"score": int(round(sem_s)),    "weight": float(w_semantics)},
+        "readability": {"score": int(round(read_s)),   "weight": float(w_readability)},
+        "tone":        {"score": int(round(tone_s)),   "weight": float(w_tone)}
+    }
+
+    # -------------------------
+    # Raw: always include mandatory keyword keys (canonical shape)
     # -------------------------
     raw_keywords = {
         "total_keyword_score": keyword_result.get("total_keyword_score", keyword_result.get("keyword_score", 0)),
-        "breakdown": keyword_result.get("breakdown", {}),
-        "raw_counts": keyword_result.get("raw_counts", {}),         # <-- ALWAYS include this key
-        "tiers_detected": keyword_result.get("tiers_detected", {})
+        "breakdown":           keyword_result.get("breakdown", {}),
+        "raw_counts":          keyword_result.get("raw_counts", {}),
+        "tiers_detected":      keyword_result.get("tiers_detected", {})
     }
 
-    # Full raw payload (unpruned)
-    raw_payload_full = {
-        "structure": structure_result,
+    # Build raw output (compact vs full)
+    raw_out_compact = {
         "keywords": raw_keywords,
-        "semantics": semantic_result,
-        "readability": readability_result,
-        "tone": tone_result,
-        "role": role_result
+        "structure": {"structure_score": structure_result.get("structure_score", None)} if structure_result else {},
+        "semantics": {"semantic_score": semantic_result.get("semantic_score", None)} if semantic_result else {},
+        "readability": {"readability_score": readability_result.get("readability_score", None)} if readability_result else {},
+        "tone": {"tone_score": tone_result.get("tone_score", None)} if tone_result else {},
+        "role": role_result or {}
     }
 
-    # -------------------------
-    # Compact raw payload (safe minimal, includes raw_counts)
-    # -------------------------
-    raw_payload_compact = {
-        "keywords": {
-            "total_keyword_score": raw_keywords["total_keyword_score"],
-            "breakdown": raw_keywords.get("breakdown", {}),
-            "raw_counts": raw_keywords.get("raw_counts", {}),      # <-- present even in compact
-            "tiers_detected": raw_keywords.get("tiers_detected", {})
-        },
-        "structure": {"structure_score": structure_result.get("structure_score")} if structure_result else {},
-        "semantics": {"semantic_score": semantic_result.get("semantic_score")} if semantic_result else {},
-        "readability": {"readability_score": readability_result.get("readability_score")} if readability_result else {},
-        "tone": {"tone_score": tone_result.get("tone_score")} if tone_result else {},
-        "role": role_result if role_result else {}
-    }
-
-    # If export_raw disabled, optionally truncate large text fields in full payload
-    if not export_raw:
-        # Do not return the full payload; return compact (but with expected keys).
-        raw_out = raw_payload_compact
-    else:
-        # For full payload, do light truncation of obvious big text fields
-        # (avoid returning multi-MB resume text)
+    if export_raw:
+        # Return full module outputs but truncate obvious large fields
         def _truncate_large_texts(obj):
             if isinstance(obj, dict):
                 for k, v in list(obj.items()):
@@ -188,25 +204,26 @@ def run_ats_v2(resume_text: str, jd_text: str) -> Dict[str, Any]:
                         _truncate_large_texts(v)
                 return obj
             return obj
-        _truncate_large_texts(raw_payload_full)
-        raw_out = raw_payload_full
+        full_raw = {
+            "keywords": raw_keywords,
+            "structure": structure_result,
+            "semantics": semantic_result,
+            "readability": readability_result,
+            "tone": tone_result,
+            "role": role_result
+        }
+        _truncate_large_texts(full_raw)
+        raw_out = full_raw
+    else:
+        raw_out = raw_out_compact
 
     # -------------------------
-    # Response
+    # Final response structure (improved schema)
     # -------------------------
     response: Dict[str, Any] = {
-        "meta": {
-            "ats_v": "2.0",
-            "export_raw": bool(export_raw)
-        },
+        "meta": {"ats_v": "2.0", "export_raw": bool(export_raw)},
         "total_score": final_score,
-        "scores": {
-            "structure": int(round(max(0, min(100, struct_s)))),
-            "keywords": int(round(max(0, min(100, key_s)))),
-            "semantics": int(round(max(0, min(100, sem_s)))),
-            "readability": int(round(max(0, min(100, read_s)))),
-            "tone": int(round(max(0, min(100, tone_s))))
-        },
+        "breakdown": breakdown,
         "role": role_result,
         "insights": insights,
         "raw": raw_out
