@@ -1,75 +1,46 @@
-import React, { useState } from 'react';
+// frontend/src/App.jsx
+
+import React from 'react';
 import { Routes, Route } from 'react-router-dom';
-import axios from 'axios';
 import { Toaster } from 'react-hot-toast';
 
-// Components
-import Sidebar from './components/Sidebar';
-import Navbar from './components/Navbar';
-import ProfileModal from './components/ProfileModal';
+// Layout Components
+import TopNav from './components/TopNav';
 import Footer from './components/Footer';
 
 // Pages
 import Dashboard from './pages/Dashboard';
 import JobAggregator from './pages/JobAggregator';
 import ResumeGenerator from './pages/ResumeGenerator';
-import MockPractice from './pages/MockPractice'; // <--- NEW IMPORT
-import AtsChecker from './pages/AtsChecker'; // <--- NEW IMPORT
-import Profile from './pages/Profile'; // <--- IMPORTED PROFILE PAGE
+import MockPractice from './pages/MockPractice';
+import AtsChecker from './pages/AtsChecker';
+import Profile from './pages/Profile';
+import AiPage from './pages/AiPage';
 
 function App() {
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [userProfile, setUserProfile] = useState({ fullName: '', email: '', phone: '', linkedin: '', skills: '' });
-
-  const handleInputChange = (e) => {
-    const { name, value } = e.target;
-    setUserProfile(prevState => ({ ...prevState, [name]: value }));
-  };
-
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    // Updated to use relative path (Proxy) + correct endpoint
-    axios.post('/api/resume/profile', userProfile)
-      .then(response => {
-        alert(response.data.message);
-        setIsModalOpen(false);
-      })
-      .catch(error => {
-        console.error('Error saving profile:', error);
-        alert('Error: Could not save profile.');
-      });
-  };
-
   return (
-    <div className="bg-gray-100 h-screen flex flex-col">
+    <div className="bg-gray-50 min-h-screen flex flex-col font-sans text-gray-900">
       <Toaster position="top-right" />
-      <Navbar />
-      <div className="flex flex-1 overflow-hidden">
-        {/* Pass userProfile to sidebar so it can display the name */}
-        <Sidebar onEditProfileClick={() => setIsModalOpen(true)} userProfile={userProfile} />
-        
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <main className="flex-grow">
-            <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/jobs" element={<JobAggregator />} />
-              <Route path="/resume" element={<ResumeGenerator />} />
-              <Route path="/mock" element={<MockPractice />} /> {/* <--- NEW ROUTE */}
-              <Route path="/ats" element={<AtsChecker />} /> {/* <--- NEW ROUTE */}
-              <Route path="/profile" element={<Profile />} /> {/* <--- PROFILE ROUTE */}
-            </Routes>
-          </main>
-          <Footer />
-        </div>
-      </div>
       
-      <ProfileModal
-        isOpen={isModalOpen}
-        onClose={() => setIsModalOpen(false)}
-        profile={userProfile}
-        handleInputChange={handleInputChange}
-        handleSubmit={handleSubmit}
-      />
+      {/* 1. Sticky Header (Replaces Sidebar + Old Navbar) */}
+      <TopNav />
+
+      {/* 2. Main Content Area */}
+      <div className="flex-grow flex flex-col">
+        <main className="w-full mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 flex-grow">
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/jobs" element={<JobAggregator />} />
+            <Route path="/resume" element={<ResumeGenerator />} />
+            <Route path="/ats" element={<AtsChecker />} />
+            <Route path="/mock" element={<MockPractice />} />
+            <Route path="/ai" element={<AiPage />} />
+            <Route path="/profile" element={<Profile />} />
+          </Routes>
+        </main>
+        
+        <Footer />
+      </div>
     </div>
   );
 }
