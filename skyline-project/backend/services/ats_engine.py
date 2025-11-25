@@ -1,6 +1,7 @@
 import spacy
 from rapidfuzz import fuzz
 from backend.services.llm_engine import LLMEngine
+from backend.services.text_cleaner import clean_text  # NEW import
 
 # Try loading SpaCy, fallback to simple splitting if not installed
 try:
@@ -12,6 +13,10 @@ def calculate_keyword_match(resume_text: str, jd_text: str) -> dict:
     """
     Analyzes keyword overlap between Resume and JD using NLP/Fuzzy logic.
     """
+    # Defensive cleaning (ensure consistent tokens)
+    resume_text = clean_text(resume_text or "", redact=False)
+    jd_text = clean_text(jd_text or "", redact=False)
+
     # 1. Basic Tokenization (Use SpaCy if available, else split)
     if nlp:
         resume_doc = nlp(resume_text.lower())
@@ -60,6 +65,10 @@ def get_ats_report(resume_text: str, jd_text: str) -> dict:
     """
     Combines Math Score (RapidFuzz) + Semantic Score (AI).
     """
+    # Clean inputs first (defense-in-depth)
+    resume_text = clean_text(resume_text or "", redact=False)
+    jd_text = clean_text(jd_text or "", redact=False)
+
     # 1. Get Hard Skills Score (Math)
     keyword_data = calculate_keyword_match(resume_text, jd_text)
     

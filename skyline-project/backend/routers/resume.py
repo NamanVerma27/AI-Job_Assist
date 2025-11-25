@@ -11,6 +11,7 @@ from backend.schemas import UserProfile
 from backend.services.scraper import extract_job_text
 from backend.services.llm_engine import LLMEngine
 from backend.services.ats_engine import get_ats_report  # <--- Added import
+from backend.services.text_cleaner import clean_text  # NEW import
 
 # Define the router
 router = APIRouter(prefix="/resume", tags=["Resume"])
@@ -51,7 +52,9 @@ async def parse_resume(file: UploadFile = File(...)):
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or DOCX.")
 
-        return {"filename": file.filename, "content": content.strip()}
+        # Clean the extracted text before returning (defensive normalization)
+        cleaned = clean_text(content, redact=False)
+        return {"filename": file.filename, "content": cleaned}
 
     except Exception as e:
         print(f"Error parsing resume: {e}")

@@ -8,6 +8,7 @@ import docx
 from backend.database import get_db
 from backend import models, schemas
 from backend.config import get_settings
+from backend.services.text_cleaner import clean_text  # NEW import
 
 router = APIRouter(prefix="/profile", tags=["Profile V2"])
 settings = get_settings()
@@ -116,13 +117,16 @@ async def add_resume(file: UploadFile = File(...), db: Session = Depends(get_db)
         print(f"Parsing error: {e}")
         content = "Error parsing file."
 
+    # Clean content before saving (defensive)
+    cleaned = clean_text(content, redact=False)
+
     # 2. Save to Database
     new_resume = models.Resume(
         user_id=user.id,
         filename=file.filename,
         filepath=f"/uploads/{file.filename}",  # Placeholder path; replace with real storage in prod
-        parsing_status="parsed" if len(content and content.strip()) > 50 else "failed",
-        content=content  # <--- Saving the extracted text
+        parsing_status="parsed" if len(cleaned and cleaned.strip()) > 50 else "failed",
+        content=cleaned  # <--- Saving the extracted text
     )
     db.add(new_resume)
     db.commit()
