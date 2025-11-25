@@ -14,6 +14,7 @@ import JobAggregator from './pages/JobAggregator';
 import ResumeGenerator from './pages/ResumeGenerator';
 import MockPractice from './pages/MockPractice';
 import AtsChecker from './pages/AtsChecker';
+import AtsResult from './pages/AtsResult'; // NEW: results dashboard
 import Profile from './pages/Profile';
 import AiPage from './pages/AiPage';
 
@@ -33,6 +34,7 @@ function App() {
             <Route path="/jobs" element={<JobAggregator />} />
             <Route path="/resume" element={<ResumeGenerator />} />
             <Route path="/ats" element={<AtsChecker />} />
+            <Route path="/ats-result" element={<AtsResult />} /> {/* NEW */}
             <Route path="/mock" element={<MockPractice />} />
             <Route path="/ai" element={<AiPage />} />
             <Route path="/profile" element={<Profile />} />
