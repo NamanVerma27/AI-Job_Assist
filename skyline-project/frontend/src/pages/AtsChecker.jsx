@@ -218,12 +218,11 @@ export default function AtsChecker() {
     <div
       className="min-h-screen py-12 px-6 rounded-[18px] overflow-hidden"
       style={{
-        background:
-          // two radial lights, then the diagonal (to bottom-right) gradient, then the original vertical linear base
-          "radial-gradient(1400px 600px at 12% 10%, rgba(229,236,255,0.55), transparent 12%), " +
-          "radial-gradient(900px 500px at 92% 34%, rgba(245,240,255,0.45), transparent 10%), " +
-          "linear-gradient(135deg, #EEF3FF 0%, #F9FAFF 100%), " +
-          "linear-gradient(180deg, #FBFDFF 0%, #F6F8FF 40%, #FFFFFF 100%)",
+        background:`
+          radial-gradient(900px 500px at 8% 8%, rgba(145, 165, 245, 0.55), transparent 65%),
+          radial-gradient(900px 500px at 92% 22%, rgba(170, 195, 255, 0.50), transparent 65%),
+          linear-gradient(135deg, #DCE4FF 0%, #EAF0FF 45%, #FFFFFF 100%)
+        `
       }}
     >
       <div className="max-w-7xl mx-auto">
