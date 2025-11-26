@@ -1,5 +1,3 @@
-// frontend/src/pages/AtsResult.jsx
-
 import React, { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { FaArrowLeft, FaCopy, FaDownload, FaMagic, FaChevronDown, FaChevronUp } from "react-icons/fa";
@@ -372,13 +370,18 @@ export default function AtsResult() {
                       </div>
                     </div>
 
-                    {/* Expandable content */}
+                    {/* Expandable content (fixed: no peek-through when collapsed) */}
                     <div
                       id={`quickwin-${idx}`}
-                      className={`px-4 pb-4 transition-all duration-200 ${isExpanded ? "max-h-screen" : "max-h-0 overflow-hidden"}`}
                       aria-hidden={!isExpanded}
+                      className={`transition-all duration-300 ease-in-out overflow-hidden ${
+                        isExpanded
+                          ? "max-h-96 p-4 opacity-100"   // expanded: allow content, apply padding
+                          : "max-h-0 p-0 opacity-0"       // collapsed: remove padding so nothing peeks, fade out
+                      }`}
+                      style={{ willChange: "max-height, opacity, padding" }}
                     >
-                      <div className="mt-2 text-sm text-gray-700">
+                      <div className="text-sm text-gray-700">
                         <div className="mb-3">
                           <div className="text-xs text-gray-500 mb-1">Before</div>
                           <div className="p-3 rounded-lg bg-white border border-gray-100 text-sm">{beforeText}</div>

@@ -1,12 +1,16 @@
 // frontend/src/pages/AtsChecker.jsx
 import React, { useEffect, useRef, useState } from "react";
 import axios from "axios";
-import { FaFileAlt, FaSpinner, FaArrowRight, FaUpload } from "react-icons/fa";
+import { FaSpinner, FaArrowRight, FaUpload } from "react-icons/fa";
 import { useNavigate } from "react-router-dom";
 import Gauge from "../components/Gauge";
 
 /**
- * Refined ATS Checker (network fallbacks + better UX)
+ * AtsChecker.jsx — layout fixes + applied ATSResult background
+ * - left content spans 8/12 on lg
+ * - right Quick Preview spans 4/12
+ * - ambient gradient + soft vignette applied to page
+ * - preserved all functionality (endpoints, file upload, sample loader)
  */
 
 export default function AtsChecker() {
@@ -20,7 +24,7 @@ export default function AtsChecker() {
   const [error, setError] = useState("");
   const fileInputRef = useRef(null);
 
-  // Try to load saved resumes (supports /api/ prefix or not)
+  // load saved resumes (try both /api/ prefix and no-prefix)
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -35,8 +39,8 @@ export default function AtsChecker() {
               payload = data;
               break;
             }
-          } catch (e) {
-            // try next
+          } catch {
+            /* ignore and try next */
           }
         }
         if (mounted && payload) setSavedResumes(payload);
@@ -63,7 +67,12 @@ export default function AtsChecker() {
   // POST to ATS endpoint with fallback logic (v2 -> v1)
   const postAtsWithFallback = async (rText, jText) => {
     const payload = { resume_text: rText, jd_text: jText };
-    const endpoints = ["/api/resume/ats-score-v2", "/api/resume/ats-score", "/resume/ats-score-v2", "/resume/ats-score"];
+    const endpoints = [
+      "/api/resume/ats-score-v2",
+      "/api/resume/ats-score",
+      "/resume/ats-score-v2",
+      "/resume/ats-score",
+    ];
     let lastErr = null;
     for (const ep of endpoints) {
       try {
@@ -71,7 +80,6 @@ export default function AtsChecker() {
         return resp.data?.data ?? resp.data;
       } catch (err) {
         lastErr = err;
-        // continue trying other endpoints
       }
     }
     throw lastErr ?? new Error("No ATS endpoint reachable.");
@@ -85,14 +93,15 @@ export default function AtsChecker() {
       const payload = await postAtsWithFallback(rText, jText);
       try {
         sessionStorage.setItem("ats_report", JSON.stringify(payload));
-      } catch (e) {
-        console.warn("Could not save report to sessionStorage:", e);
+      } catch {
+        /* ignore storage errors */
       }
       navigate("/ats-result", { state: { report: payload } });
     } catch (err) {
       console.error("ATS analysis failed:", err);
       const msg = err?.response?.data?.detail || err?.message || "Analysis failed. Check backend or endpoint.";
       setError(msg);
+      window.scrollTo({ top: 0, behavior: "smooth" });
     } finally {
       setLoading(false);
     }
@@ -103,7 +112,7 @@ export default function AtsChecker() {
     await runAnalysisAndNavigate(resumeText, jdText);
   };
 
-  // Upload file with same fallback logic for endpoints
+  // Upload with fallback endpoints
   const uploadWithFallback = async (file) => {
     const form = new FormData();
     form.append("file", file);
@@ -158,7 +167,7 @@ export default function AtsChecker() {
     }
   };
 
-  // Dev sample loader: try /api/dev/sample-resume then /dev/sample-resume
+  // Dev sample loader (tries multiple dev routes)
   const SAMPLE_PATH = "/mnt/data/web-developer-resume-example.pdf";
   const handleLoadSampleAndAutoRun = async () => {
     setLoading(true);
@@ -174,8 +183,8 @@ export default function AtsChecker() {
             content = c;
             break;
           }
-        } catch (e) {
-          // try next
+        } catch {
+          /* ignore */
         }
       }
       if (!content) {
@@ -205,21 +214,32 @@ export default function AtsChecker() {
   const jdWordCount = jdText ? jdText.trim().split(/\s+/).length : 0;
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-50 to-white py-12 px-6">
-      <div className="max-w-6xl mx-auto">
+    // page background: consistent ultra-premium gradient + soft vignette
+    <div
+      className="min-h-screen py-12 px-6 rounded-[18px] overflow-hidden"
+      style={{
+        background:
+          // two radial lights, then the diagonal (to bottom-right) gradient, then the original vertical linear base
+          "radial-gradient(1400px 600px at 12% 10%, rgba(229,236,255,0.55), transparent 12%), " +
+          "radial-gradient(900px 500px at 92% 34%, rgba(245,240,255,0.45), transparent 10%), " +
+          "linear-gradient(135deg, #EEF3FF 0%, #F9FAFF 100%), " +
+          "linear-gradient(180deg, #FBFDFF 0%, #F6F8FF 40%, #FFFFFF 100%)",
+      }}
+    >
+      <div className="max-w-7xl mx-auto">
         {/* Header */}
-        <div className="mb-6 flex items-start justify-between gap-6">
+        <header className="mb-8 flex items-start justify-between gap-6">
           <div>
-            <h1 className="text-3xl font-extrabold text-gray-900">ATS Score Checker</h1>
-            <p className="text-gray-600 mt-1 max-w-2xl">
-              Compare your resume against a job description. Results open in a dedicated dashboard with prioritized fixes.
+            <h1 className="text-3xl sm:text-4xl font-extrabold text-gray-900 tracking-tight">ATS Score Checker</h1>
+            <p className="text-gray-600 mt-2 max-w-2xl leading-relaxed">
+              Compare your resume against a job description. Results open in a detailed dashboard with prioritized, AI-guided fixes.
             </p>
           </div>
 
           <div className="hidden sm:flex items-center gap-3">
             <button
               onClick={handleLoadSampleAndAutoRun}
-              className="inline-flex items-center gap-2 px-3 py-2 rounded-full bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-100"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-full bg-gradient-to-r from-purple-100 to-indigo-50 text-indigo-700 border border-white/40 shadow-sm"
               title="Load developer sample and auto-run (dev)"
               disabled={loading}
             >
@@ -228,7 +248,7 @@ export default function AtsChecker() {
 
             <button
               onClick={onUploadButtonClick}
-              className="inline-flex items-center gap-2 px-3 py-2 rounded-full bg-white border border-gray-200 text-sm shadow-sm hover:shadow-md"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-full bg-white/80 backdrop-blur-sm border border-gray-100 text-sm shadow-md"
               aria-label="Upload resume file"
               disabled={uploading}
             >
@@ -247,21 +267,24 @@ export default function AtsChecker() {
               }}
             />
           </div>
-        </div>
+        </header>
 
-        {/* Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {/* Left */}
-          <div>
-            <div className="bg-white rounded-2xl p-5 shadow-lg border border-gray-100">
+        {/* use 12-col grid so left has room and right doesn't hug left */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-10">
+          {/* Left main input area: span 8 columns on large screens */}
+          <div className="lg:col-span-7 space-y-6">
+            <section
+              className="rounded-2xl p-6 shadow-xl border border-white/30 backdrop-blur-md bg-white/60"
+              aria-labelledby="resume-section"
+            >
               <div className="flex items-start justify-between">
                 <div>
-                  <h3 className="text-lg font-semibold text-gray-800">1. Resume</h3>
-                  <p className="text-sm text-gray-500 mt-1">Paste parsed resume text (or upload a file / load sample).</p>
+                  <h3 id="resume-section" className="text-lg font-semibold text-gray-800">1. Resume</h3>
+                  <p className="text-sm text-gray-500 mt-1">Paste parsed resume text (or upload a file / load the sample).</p>
                 </div>
 
                 <div className="flex items-center gap-3">
-                  <select onChange={handleSelectSaved} className="text-sm border rounded-lg px-3 py-1 bg-white hidden sm:block">
+                  <select onChange={handleSelectSaved} className="text-sm border rounded-lg px-3 py-1 bg-white/80 hidden sm:block">
                     <option value="">Use saved resume...</option>
                     {savedResumes.map((r) => (
                       <option key={r.id} value={r.id}>
@@ -271,19 +294,19 @@ export default function AtsChecker() {
                   </select>
 
                   <div className="sm:hidden flex items-center gap-2">
-                    <button onClick={handleLoadSampleAndAutoRun} className="px-3 py-1 rounded-full bg-indigo-50 text-indigo-700 text-sm" disabled={loading}>Sample</button>
-                    <button onClick={onUploadButtonClick} className="px-3 py-1 rounded-full bg-white border text-sm" disabled={uploading}>Upload</button>
+                    <button onClick={handleLoadSampleAndAutoRun} className="px-3 py-1 rounded-full bg-gradient-to-r from-purple-100 to-indigo-50 text-indigo-700 text-sm" disabled={loading}>
+                      Sample
+                    </button>
+                    <button onClick={onUploadButtonClick} className="px-3 py-1 rounded-full bg-white/80 border text-sm" disabled={uploading}>
+                      Upload
+                    </button>
                   </div>
                 </div>
               </div>
 
               <div className="mt-4">
                 <div className="flex items-center justify-between gap-4">
-                  <button
-                    onClick={() => setPreviewOpen((s) => !s)}
-                    className="text-sm text-indigo-700 font-medium hover:underline"
-                    aria-expanded={previewOpen}
-                  >
+                  <button onClick={() => setPreviewOpen((s) => !s)} className="text-sm text-indigo-700 font-medium hover:underline" aria-expanded={previewOpen}>
                     {previewOpen ? "Hide resume preview" : "Show resume preview"}
                   </button>
 
@@ -295,7 +318,7 @@ export default function AtsChecker() {
                     value={resumeText}
                     onChange={(e) => setResumeText(e.target.value)}
                     rows={12}
-                    className="mt-3 w-full rounded-xl border border-gray-100 p-4 text-sm shadow-sm focus:ring-2 focus:ring-indigo-200 resize-y"
+                    className="mt-3 w-full rounded-2xl border border-white/40 p-4 text-sm shadow-sm focus:ring-2 focus:ring-indigo-200 resize-y bg-white/60 backdrop-blur-sm"
                     placeholder="Paste resume text here (contact info, summary, skills, experience bullets, education)..."
                     aria-label="Resume text"
                   />
@@ -305,18 +328,19 @@ export default function AtsChecker() {
                   <div>Tip: include a Skills section formatted as bullet points or comma-separated tags.</div>
                   <div>
                     {uploading ? (
-                      <span className="inline-flex items-center gap-2 text-sm text-gray-600"><FaSpinner className="animate-spin" /> Uploading...</span>
+                      <span className="inline-flex items-center gap-2 text-sm text-gray-600">
+                        <FaSpinner className="animate-spin" /> Uploading...
+                      </span>
                     ) : null}
                   </div>
                 </div>
               </div>
-            </div>
+            </section>
 
-            {/* JD card */}
-            <div className="mt-6 bg-white rounded-2xl p-5 shadow-lg border border-gray-100">
+            <section className="rounded-2xl p-6 shadow-xl border border-white/30 backdrop-blur-md bg-white/60" aria-labelledby="jd-section">
               <div className="flex items-start justify-between">
                 <div>
-                  <h3 className="text-lg font-semibold text-gray-800">2. Job Description</h3>
+                  <h3 id="jd-section" className="text-lg font-semibold text-gray-800">2. Job Description</h3>
                   <p className="text-sm text-gray-500 mt-1">Paste the full job description you want to target. Include Requirements & Skills sections.</p>
                 </div>
 
@@ -328,7 +352,7 @@ export default function AtsChecker() {
                 value={jdText}
                 onChange={(e) => setJdText(e.target.value)}
                 rows={12}
-                className="mt-4 w-full rounded-xl border border-gray-100 p-4 text-sm shadow-sm focus:ring-2 focus:ring-indigo-200 resize-y"
+                className="mt-4 w-full rounded-2xl border border-white/40 p-4 text-sm shadow-sm focus:ring-2 focus:ring-indigo-200 resize-y bg-white/60 backdrop-blur-sm"
                 placeholder="Paste job description here..."
                 aria-label="Job description"
               />
@@ -337,45 +361,94 @@ export default function AtsChecker() {
                 <div>Tip: highlight MUST HAVE skills in the JD for better tier detection.</div>
                 <div />
               </div>
-            </div>
+            </section>
           </div>
 
-          {/* Right */}
-          <aside className="sticky top-28">
-            <div className="bg-white rounded-2xl p-6 shadow-lg border border-gray-100">
-              <div className="mb-4">
-                <h4 className="text-sm text-gray-500">Quick Preview</h4>
-                <p className="text-lg font-semibold text-gray-900">Snapshot & actions</p>
-              </div>
+          {/* Middle spacing */}
+          <div className="hidden lg:block lg:col-span-1" />
 
-              <div className="mb-4">
-                <Gauge value={0} />
-              </div>
+          {/* Right preview/CTA: span 4 columns on large screens */}
+          <aside className="lg:col-span-4">
+            {/* decorative floating glow behind the right card */}
+            <div
+              aria-hidden
+              className="pointer-events-none absolute right-0 hidden lg:block"
+              style={{
+                width: 340,
+                height: 340,
+                transform: "translate(16%, -10%)",
+                filter: "blur(60px)",
+                background: "radial-gradient(circle at 30% 40%, rgba(99,102,241,0.18), rgba(99,102,241,0.08) 30%, transparent 60%)",
+                borderRadius: "50%",
+                zIndex: 0,
+              }}
+            />
 
-              <div className="space-y-3">
-                <button
-                  onClick={handleAnalyzeClick}
-                  disabled={loading}
-                  className="w-full inline-flex items-center justify-center gap-3 px-4 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-blue-500 text-white font-semibold shadow-xl hover:from-indigo-700 hover:to-blue-600 transform transition"
-                >
-                  {loading ? <><FaSpinner className="animate-spin" /> Calculating...</> : <>Calculate Score <FaArrowRight /></>}
-                </button>
+            <div style={{ position: "relative", zIndex: 10 }}>
+              <div className="rounded-2xl p-6 shadow-2xl border border-white/30 backdrop-blur-md bg-white/65">
+                <div className="mb-4">
+                  <h4 className="text-sm text-gray-500">Quick Preview</h4>
+                  <p className="text-lg font-semibold text-gray-900">Snapshot & actions</p>
+                </div>
 
-                <button
-                  onClick={handleLoadSampleAndAutoRun}
-                  disabled={loading}
-                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg border border-gray-100 bg-white text-sm"
-                >
-                  Load sample & auto-run
-                </button>
+                {/* Gauge (compact) centered */}
+                <div className="flex items-center justify-center mb-2">
+                  {/* compact true -> only SVG arc is rendered */}
+                  <div className="w-36 h-36">
+                    <Gauge value={0} compact={true} size={144} thickness={12} />
+                  </div>
+                </div>
 
-                <div className="pt-2 text-xs text-gray-500">
-                  Results open in a dedicated dashboard with detailed recommendations.
+                {/* Score Text (single source of truth) */}
+                <div className="mb-6 text-center">
+                  <p className="text-sm text-gray-500 font-medium">Overall Match</p>
+                  <h2 className="text-3xl font-bold text-gray-900 mt-1">0%</h2>
+                  <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+                    Combined: Keywords, Structure, Semantics,
+                    <br />
+                    Readability, Tone.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <button
+                    onClick={handleAnalyzeClick}
+                    disabled={loading}
+                    className="w-full inline-flex items-center justify-center gap-3 px-4 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-blue-500 text-white font-semibold shadow-lg hover:from-indigo-700 hover:to-blue-600 transition"
+                  >
+                    {loading ? (
+                      <>
+                        <FaSpinner className="animate-spin" /> Calculating...
+                      </>
+                    ) : (
+                      <>
+                        Calculate Score <FaArrowRight />
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={handleLoadSampleAndAutoRun}
+                    disabled={loading}
+                    className="w-full inline-flex items-center justify-center gap-2
+                              px-4 py-2 rounded-lg
+                              border border-gray-300
+                              bg-gray-200/60
+                              text-gray-700
+                              hover:bg-gray-300
+                              text-sm
+                              backdrop-blur-sm
+                              transition"
+                  >
+                    Load sample & auto-run
+                  </button>
+
+                  <div className="pt-2 text-xs text-gray-500">Results open in a dedicated dashboard with detailed recommendations.</div>
                 </div>
               </div>
-            </div>
 
-            <div className="mt-6 text-center text-sm text-gray-500">We analyze Structure · Keywords · Semantics · Readability · Tone</div>
+              <div className="mt-6 text-center text-sm text-gray-500">We analyze Structure · Keywords · Semantics · Readability · Tone</div>
+            </div>
           </aside>
         </div>
 
