@@ -13,6 +13,39 @@ import Gauge from "../components/Gauge";
  * - preserved all functionality (endpoints, file upload, sample loader)
  */
 
+// --- HARDCODED SAMPLE DATA (Replaces broken dev endpoint) ---
+const SAMPLE_RESUME = `JACKSON MACARTHUR
+Web Developer
+Atlanta, GA | 123-456-7890 | jack@email.com
+
+SUMMARY
+Software engineer with a proven ability to adapt in collaborative environments.
+Spearheaded transition from Firebase to AWS, saving company $3,700+ monthly.
+
+SKILLS
+JavaScript, HTML, CSS, React.js, Node.js, Angular.js, MongoDB, AWS, Java
+
+EXPERIENCE
+Web Developer | Squarespace | August 2020 - Current
+- Coached 4 junior designers in ARIA accessibility standards.
+- Created and oversaw wireframe designs from client requests.
+- Developed documentation to teach new team members company standards.
+
+Web Designer | Coca-Cola | Jan 2017 - Aug 2020
+- Built mock designs and wireframes for landing pages.
+- Collaborated on Complexity Score tool to remove process bottlenecks.`;
+
+const SAMPLE_JD = `We are looking for a Senior Web Developer.
+
+REQUIRED SKILLS:
+- JavaScript, HTML, CSS
+- Experience with React.js and Node.js is essential.
+- Knowledge of AWS and database management (MongoDB).
+
+PREFERRED:
+- Experience with Angular.js
+- Strong communication skills.`;
+
 export default function AtsChecker() {
   const navigate = useNavigate();
   const [resumeText, setResumeText] = useState("");
@@ -167,47 +200,20 @@ export default function AtsChecker() {
     }
   };
 
-  // Dev sample loader (tries multiple dev routes)
-  const SAMPLE_PATH = "/mnt/data/web-developer-resume-example.pdf";
+  // --- UPDATED: Client-side Sample Loader (Replaces broken /api/dev call) ---
   const handleLoadSampleAndAutoRun = async () => {
     setLoading(true);
     setError("");
-    try {
-      const tryUrls = ["/api/dev/sample-resume", "/dev/sample-resume", "/api/dev/sample", "/dev/sample"];
-      let content = null;
-      for (const u of tryUrls) {
-        try {
-          const res = await axios.get(u, { params: { path: SAMPLE_PATH } });
-          const c = res.data?.data?.content ?? res.data?.content ?? res.data;
-          if (c && c.toString().trim()) {
-            content = c;
-            break;
-          }
-        } catch {
-          /* ignore */
-        }
-      }
-      if (!content) {
-        setError("Sample resume could not be loaded. Ensure dev route is available.");
-        setLoading(false);
-        return;
-      }
-      setResumeText(content);
-      if (jdText && jdText.trim()) {
-        await runAnalysisAndNavigate(content, jdText);
-      } else {
-        setPreviewOpen(true);
-        setTimeout(() => {
-          const el = document.querySelector("#jd-input");
-          if (el) el.focus();
-        }, 80);
-      }
-    } catch (err) {
-      console.error("Sample loader failed:", err);
-      setError(err?.response?.data?.detail || "Could not load sample. Ensure dev route is enabled.");
-    } finally {
-      setLoading(false);
-    }
+    
+    // 1. Load Data Instantly
+    setResumeText(SAMPLE_RESUME);
+    setJdText(SAMPLE_JD);
+    setPreviewOpen(true);
+
+    // 2. Small delay to visualize the load, then run
+    setTimeout(async () => {
+      await runAnalysisAndNavigate(SAMPLE_RESUME, SAMPLE_JD);
+    }, 600);
   };
 
   const resumeCharCount = resumeText ? resumeText.length : 0;

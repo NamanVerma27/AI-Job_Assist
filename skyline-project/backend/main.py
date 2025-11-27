@@ -6,7 +6,6 @@ from backend.database import engine, Base
 # Routers
 from backend.routers import ai, jobs, resume, profile
 from backend.routers import ai_enhance  # <-- NEW: AI enhancement (with alias)
-from backend.routers import dev          # <-- Dev tools (sample resume)
 
 # Environment
 from dotenv import load_dotenv
@@ -46,9 +45,6 @@ app.include_router(profile.router)
 # AI ATS Enhancement
 app.include_router(ai_enhance.router)        # Correct route → /api/ai/enhance-ats
 app.include_router(ai_enhance.alias_router)  # Legacy alias → /ai/enhance-ats
-
-# Dev utilities (disable in prod)
-app.include_router(dev.router)
 
 # -------------------------------------------------
 # HEALTH CHECK
