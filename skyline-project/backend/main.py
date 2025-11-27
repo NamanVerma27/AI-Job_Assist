@@ -5,7 +5,8 @@ from backend.database import engine, Base
 
 # Routers
 from backend.routers import ai, jobs, resume, profile
-from backend.routers import ai_enhance  # <-- NEW: AI enhancement (with alias)
+from backend.routers import ai_enhance  # <-- AI enhancement (with alias)
+from backend.routers import mock_v2     # <-- NEW: Mock Interview V2 router
 
 # Environment
 from dotenv import load_dotenv
@@ -33,18 +34,21 @@ app.add_middleware(
 )
 
 # -------------------------------------------------
-# ROUTERS (order does not matter, but grouping helps)
+# ROUTERS
 # -------------------------------------------------
 
-# Core features
+# Core Feature Modules
 app.include_router(ai.router)
 app.include_router(jobs.router)
 app.include_router(resume.router)
 app.include_router(profile.router)
 
-# AI ATS Enhancement
-app.include_router(ai_enhance.router)        # Correct route → /api/ai/enhance-ats
-app.include_router(ai_enhance.alias_router)  # Legacy alias → /ai/enhance-ats
+# Mock Interview V2
+app.include_router(mock_v2.router)          # <-- ADDED
+
+# ATS Enhancement
+app.include_router(ai_enhance.router)       # Correct: /api/ai/enhance-ats
+app.include_router(ai_enhance.alias_router) # Legacy: /ai/enhance-ats
 
 # -------------------------------------------------
 # HEALTH CHECK
@@ -58,7 +62,7 @@ async def health_check():
     return {"status": "ok", "env": settings.ENV}
 
 # -------------------------------------------------
-# Local Development Entry
+# LOCAL DEV ENTRY
 # -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn

@@ -75,3 +75,63 @@ class Resume(Base):
     content = Column(Text, nullable=True)  # <--- NEW FIELD ADDED
 
     owner = relationship("User", back_populates="resumes")
+
+
+class InterviewSession(Base):
+    __tablename__ = "interview_sessions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    
+    # Configuration
+    target_role = Column(String)
+    difficulty = Column(String) # Easy, Medium, Hard
+    interview_type = Column(String) # Technical, Behavioral, Mixed
+    total_questions = Column(Integer)
+    resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    
+    # State
+    status = Column(String, default="setup") # setup, in_progress, completed
+    current_question_index = Column(Integer, default=0)
+    
+    # Final Scores (Nullable until complete)
+    overall_score = Column(Integer, nullable=True)
+    technical_score = Column(Integer, nullable=True)
+    communication_score = Column(Integer, nullable=True)
+    structure_score = Column(Integer, nullable=True)
+    impact_score = Column(Integer, nullable=True)
+    behavioral_score = Column(Integer, nullable=True)
+    
+    # NEW: Stores the full JSON analysis (Strengths, Weaknesses, Quick Wins)
+    feedback_report = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    owner = relationship("User") # implied back_populates if needed
+    resume = relationship("Resume")
+    exchanges = relationship("InterviewExchange", back_populates="session", cascade="all, delete-orphan")
+
+
+class InterviewExchange(Base):
+    __tablename__ = "interview_exchanges"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("interview_sessions.id"))
+    
+    question_text = Column(Text)
+    question_order = Column(Integer) # 1, 2, 3...
+    
+    user_answer = Column(Text, nullable=True)
+    
+    # Atomic Scores
+    score_correctness = Column(Integer, nullable=True)
+    score_clarity = Column(Integer, nullable=True)
+    score_confidence = Column(Integer, nullable=True)
+    
+    ai_feedback = Column(Text, nullable=True) # Micro-feedback
+
+    # NEW: Stores the AI's improved or rewritten version of the user's answer
+    improved_answer = Column(Text, nullable=True)
+    
+    session = relationship("InterviewSession", back_populates="exchanges")

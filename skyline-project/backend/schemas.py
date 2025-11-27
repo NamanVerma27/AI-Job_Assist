@@ -72,3 +72,23 @@ class UserProfile(BaseModel):
 
     class Config:
         extra = "allow"
+
+
+# --- Mock Interview V2 Schemas ---
+
+class InterviewSetupRequest(BaseModel):
+    target_role: str
+    difficulty: str = "Medium"
+    interview_type: str = "Mixed"
+    question_count: int = 5
+    resume_id: Optional[int] = None
+
+
+class InterviewSessionRead(BaseModel):
+    id: int
+    target_role: str
+    difficulty: str
+    status: str
+    current_question_index: int
+    total_questions: int
+    created_at: datetime

@@ -165,6 +165,52 @@ class LLMEngine:
                 system_msg = "You are a Career Coach. Rewrite the input into a single powerful bullet point. RULES: Start with a strong Action Verb. Quantify results where possible. NO lists."
             elif task_type == "mock_interview":
                 system_msg = f"You are a strict interviewer for a {role} role. Ask short, relevant questions."
+
+            # --- MOCK INTERVIEW PROMPTS ---
+            elif task_type == "generate_question":
+                # Prompt expects: "Role: X, Difficulty: Y, Topic: Z"
+                system_msg = (
+                    "You are a strict Technical Interviewer. "
+                    "Task: Generate ONE interview question based on the user's role. "
+                    "Constraint: Keep it professional. No greetings. Just the question."
+                )
+
+            elif task_type == "evaluate_answer":
+                # Prompt expects: "Question: Q, Answer: A"
+                system_msg = (
+                    "You are a Technical Interviewer evaluating a candidate. "
+                    "Task: Provide 2 sentences of micro-feedback. "
+                    "1. Is it correct? "
+                    "2. What is one specific improvement? "
+                    "Constraint: Be direct. Do not say 'Great job' unless it was perfect."
+                )
+
+            elif task_type == "generate_interview_report":
+                system_msg = """
+                You are a Senior Bar Raiser (Interviewer).
+                Task: Analyze the interview transcript.
+                Output: Strictly valid JSON.
+                
+                JSON Structure:
+                {
+                    "scores": {
+                        "technical": 0-100,
+                        "communication": 0-100,
+                        "structure": 0-100,
+                        "impact": 0-100,
+                        "behavioral": 0-100,
+                        "overall": 0-100
+                    },
+                    "feedback": {
+                        "strengths": ["point 1", "point 2"],
+                        "weaknesses": ["point 1", "point 2"],
+                        "quick_wins": [
+                             {"title": "Fix X", "description": "Do Y"}
+                        ]
+                    }
+                }
+                """
+
             elif task_type == "resume":
                 system_msg = "You are an expert Resume Writer. Output valid JSON only."
             elif task_type == "reformat_description":
@@ -172,6 +218,20 @@ class LLMEngine:
                     "You are a professional technical writer. Reformat the USER'S DESCRIPTION into a single clean formatted paragraph. "
                     "Output ONLY the paragraph, nothing else especially no key points."
                 )
+
+            elif task_type == "improve_mock_answer":
+                # Prompt expects: "Question: Q, User Answer: A"
+                system_msg = """
+                You are an Expert Interview Coach.
+                Task: Rewrite the candidate's answer to be a "10/10" response.
+                
+                RULES:
+                1. Keep the candidate's core experience if possible, but structure it better (STAR method).
+                2. Add metrics/results if missing (use placeholders like [X]%).
+                3. Keep it concise (max 3-4 sentences).
+                4. Tone: Confident and Professional.
+                """
+
             else:
                 system_msg = f"You are a helpful assistant. Role: {role}."
 
