@@ -1,166 +1,248 @@
 # backend/services/mock_engine.py
+import logging
 from sqlalchemy.orm import Session
 from backend import models
 from backend.services.llm_engine import LLMEngine
 from datetime import datetime
 import json
 
+logger = logging.getLogger("mock_service")
+
+
 class MockService:
-    
+
+    # ---------------------------------------------------------
+    # Get the next question
+    # ---------------------------------------------------------
     @staticmethod
     def get_next_question(session_id: int, db: Session):
-        session = db.query(models.InterviewSession).filter(models.InterviewSession.id == session_id).first()
+        session = (
+            db.query(models.InterviewSession)
+            .filter(models.InterviewSession.id == session_id)
+            .first()
+        )
         if not session:
             return None
 
-        # Check if finished
+        # End if already completed
         if session.current_question_index >= session.total_questions:
             session.status = "completed"
             db.commit()
             return {"status": "completed"}
 
-        # Generate Question via AI
-        prompt = f"Role: {session.target_role}, Difficulty: {session.difficulty}, Question Number: {session.current_question_index + 1}"
-        
-        # If resume is attached, we could append resume context here (Phase 3)
-        
-        question_text = LLMEngine.generate_response(prompt, task_type="generate_question")
-        
-        # Save to DB
+        # Generate AI question
+        prompt = (
+            f"Role: {session.target_role}, "
+            f"Difficulty: {session.difficulty}, "
+            f"Question Number: {session.current_question_index + 1}"
+        )
+
+        question_text = LLMEngine.generate_response(
+            prompt, task_type="generate_question"
+        )
+
+        # Save exchange
         exchange = models.InterviewExchange(
             session_id=session.id,
             question_order=session.current_question_index + 1,
-            question_text=question_text
+            question_text=question_text,
         )
         db.add(exchange)
-        
-        # Update Session State
+
+        # Update session
         session.current_question_index += 1
         session.status = "in_progress"
         db.commit()
         db.refresh(exchange)
-        
+
         return {
             "status": "in_progress",
             "question_id": exchange.id,
             "question_text": question_text,
             "current_index": session.current_question_index,
-            "total_questions": session.total_questions
+            "total_questions": session.total_questions,
         }
 
+    # ---------------------------------------------------------
+    # Submit answer
+    # ---------------------------------------------------------
     @staticmethod
     def submit_answer(exchange_id: int, user_answer: str, db: Session):
-        exchange = db.query(models.InterviewExchange).filter(models.InterviewExchange.id == exchange_id).first()
+        exchange = (
+            db.query(models.InterviewExchange)
+            .filter(models.InterviewExchange.id == exchange_id)
+            .first()
+        )
         if not exchange:
             return None
-            
-        # 1. Save Answer
-        exchange.user_answer = user_answer
-        
-        # 2. Generate Micro-Feedback (Fast evaluation)
-        prompt = f"Question: {exchange.question_text}\nAnswer: {user_answer}"
-        feedback = LLMEngine.generate_response(prompt, task_type="evaluate_answer")
-        exchange.ai_feedback = feedback
-        
-        # 3. Commit
-        db.commit()
-        
-        return {
-            "feedback": feedback
-        }
 
+        # Save answer
+        exchange.user_answer = user_answer.strip() if user_answer else ""
+
+        # Micro-feedback
+        prompt = (
+            f"Question: {exchange.question_text}\n"
+            f"Answer: {exchange.user_answer}"
+        )
+        feedback = LLMEngine.generate_response(
+            prompt, task_type="evaluate_answer"
+        )
+        exchange.ai_feedback = feedback
+
+        # ---------------------------------------------------------
+        # ATOMIC SCORING (deterministic fallback)
+        # ---------------------------------------------------------
+        ans = exchange.user_answer.lower()
+
+        def word_count(s):
+            return len(s.split())
+
+        # Simple heuristic scoring
+        exchange.score_correctness = 70 if len(ans) > 20 else 40
+        exchange.score_clarity = 60 if "." in ans else 35
+        exchange.score_confidence = 65 if "i" not in ans[:5] else 45
+
+        db.commit()
+
+        return {"feedback": feedback}
+
+    # ---------------------------------------------------------
+    # End session + Full scoring
+    # ---------------------------------------------------------
     @staticmethod
     def end_session_and_score(session_id: int, db: Session):
-        session = db.query(models.InterviewSession).filter(models.InterviewSession.id == session_id).first()
+        session = (
+            db.query(models.InterviewSession)
+            .filter(models.InterviewSession.id == session_id)
+            .first()
+        )
         if not session:
             return None
 
-        # 1. Compile Transcript & Generate Improvements
+        exchanges = session.exchanges or []
         transcript_text = ""
-        for ex in session.exchanges:
-            transcript_text += f"Q: {ex.question_text}\nA: {ex.user_answer}\n\n"
-            
-            # --- NEW: Generate Improved Answer for every question ---
-            # (In production, consider limiting to low-scoring answers to save tokens)
+
+        # Pick improved-answer candidates (short answers only)
+        improve_candidates = []
+        for ex in exchanges:
+            ua = (ex.user_answer or "").strip()
+            if not ua or len(ua.split()) < 15:
+                improve_candidates.append(ex)
+
+        improve_candidates = improve_candidates[:3]
+
+        # Build transcript
+        for ex in exchanges:
+            ua = ex.user_answer if ex.user_answer else "[no answer provided]"
+            transcript_text += f"Q: {ex.question_text}\nA: {ua}\n\n"
+
+        # Generate improved answers
+        for ex in improve_candidates:
             try:
-                improve_prompt = f"Question: {ex.question_text}\nUser Answer: {ex.user_answer}"
-                better_version = LLMEngine.generate_response(improve_prompt, task_type="improve_mock_answer")
-                ex.improved_answer = better_version
+                prompt = (
+                    f"Question: {ex.question_text}\n"
+                    f"User Answer: {ex.user_answer}"
+                )
+                improved = LLMEngine.generate_response(
+                    prompt, task_type="improve_mock_answer"
+                )
+                ex.improved_answer = improved
             except Exception as e:
-                # If improvement fails, keep improved_answer empty and continue
+                logger.error(f"Improve-answer error for ex {ex.id}: {e}")
                 ex.improved_answer = None
-                print(f"Improve-answer error for exchange {ex.id}: {e}")
-            # --------------------------------------------------------
+
+        db.commit()
 
         if not transcript_text:
             transcript_text = "No answers recorded."
 
-        # 2. Call AI for Analysis (Existing logic)
-        prompt = f"Role: {session.target_role}\n\nTranscript:\n{transcript_text}"
-        
+        # ------------------------------
+        # CALL AI FOR FULL REPORT
+        # ------------------------------
+        prompt = (
+            f"Role: {session.target_role}\n\n"
+            f"Transcript:\n{transcript_text}"
+        )
+
+        raw_json = LLMEngine.generate_response(
+            prompt, task_type="generate_interview_report"
+        )
+
+        if not raw_json:
+            logger.error("AI report empty or failed.")
+            return {"status": "error", "message": "AI scoring failed"}
+
+        # Parse JSON safely
         try:
-            raw_json = LLMEngine.generate_response(prompt, task_type="generate_interview_report")
-            # Clean JSON (remove markdown wrappers if any)
-            clean_json = raw_json.replace("```json", "").replace("```", "").strip()
-            data = json.loads(clean_json)
-            
-            # 3. Save Scores to DB
-            scores = data.get("scores", {})
-            session.overall_score = scores.get("overall", 50)
-            session.technical_score = scores.get("technical", 50)
-            session.communication_score = scores.get("communication", 50)
-            session.structure_score = scores.get("structure", 50)
-            session.impact_score = scores.get("impact", 50)
-            session.behavioral_score = scores.get("behavioral", 50)
-            
-            # 4. Save Text Report
-            session.feedback_report = json.dumps(data.get("feedback", {}))
-            session.status = "completed"
-            
-            # Commit all changes (scores + improved answers saved above)
-            db.commit()
-            
-            return {
-                "status": "success",
-                "scores": scores,
-                "feedback": data.get("feedback", {})
-            }
-            
+            start = raw_json.find("{")
+            end = raw_json.rfind("}")
+            json_block = raw_json[start : end + 1]
+            data = json.loads(json_block)
         except Exception as e:
-            print(f"Scoring Error: {e}")
-            # Fallback for error
-            return {
-                "status": "error", 
-                "message": "AI scoring failed."
-            }
-            
+            logger.error(f"Report JSON decode error: {e}")
+            return {"status": "error", "message": "Parsing failed"}
+
+        # Save scores
+        scores = data.get("scores", {})
+        session.overall_score = scores.get("overall", 50)
+        session.technical_score = scores.get("technical", 50)
+        session.communication_score = scores.get("communication", 50)
+        session.structure_score = scores.get("structure", 50)
+        session.impact_score = scores.get("impact", 50)
+        session.behavioral_score = scores.get("behavioral", 50)
+
+        session.feedback_report = json.dumps(data.get("feedback", {}))
+        session.status = "completed"
+
+        db.commit()
+
+        return {
+            "status": "success",
+            "scores": scores,
+            "feedback": data.get("feedback", {}),
+        }
+
+    # ---------------------------------------------------------
+    # Get final results
+    # ---------------------------------------------------------
     @staticmethod
     def get_results(session_id: int, db: Session):
-        session = db.query(models.InterviewSession).filter(models.InterviewSession.id == session_id).first()
+        session = (
+            db.query(models.InterviewSession)
+            .filter(models.InterviewSession.id == session_id)
+            .first()
+        )
         if not session or session.status != "completed":
             return None
-            
-        feedback = json.loads(session.feedback_report) if session.feedback_report else {}
-        
-        # --- NEW: Serialize Transcript ---
+
+        feedback = (
+            json.loads(session.feedback_report)
+            if session.feedback_report
+            else {}
+        )
+
         transcript = []
-        for ex in session.exchanges:
-            transcript.append({
-                "question": ex.question_text,
-                "user_answer": ex.user_answer,
-                "feedback": ex.ai_feedback,
-                "improved_answer": ex.improved_answer
-            })
-        
+        for ex in session.exchanges or []:
+            transcript.append(
+                {
+                    "question": ex.question_text,
+                    "user_answer": ex.user_answer
+                    if ex.user_answer
+                    else "[no answer provided]",
+                    "feedback": ex.ai_feedback,
+                    "improved_answer": ex.improved_answer,
+                }
+            )
+
         return {
             "overall_score": session.overall_score,
             "dimensions": {
-                "Technical": session.technical_score,
-                "Communication": session.communication_score,
-                "Structure": session.structure_score,
-                "Impact": session.impact_score,
-                "Behavioral": session.behavioral_score
+                "technical": session.technical_score,
+                "communication": session.communication_score,
+                "structure": session.structure_score,
+                "impact": session.impact_score,
+                "behavioral": session.behavioral_score,
             },
             "feedback": feedback,
-            "transcript": transcript  # <--- Send to frontend
+            "transcript": transcript,
         }
