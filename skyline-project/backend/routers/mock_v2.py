@@ -1,344 +1,241 @@
 # backend/routers/mock_v2.py
 """
-Compatibility router for Mock Interview endpoints.
+Mock Interview V2 router
+- Start session:   POST /mock/start       { role, difficulty, question_count, resume_id? }
+- Next question:   POST /mock/question    { session_id }
+- Submit answer:   POST /mock/answer      { session_id, question_id, answer }
+- End session:     POST /mock/end         { session_id }  (finalizes & returns results)
+- Get results:     GET  /mock/results/{session_id}
 
-Provides:
- - POST /mock/start and POST /mock-v2/start
- - POST /mock/question and POST /mock-v2/question
- - POST /mock/answer and POST /mock-v2/answer
- - POST /mock/end and POST /mock-v2/finish (aliases)
- - GET  /mock/{session_id}/results and /mock-v2/{session_id}/results
-
-This is intentionally deterministic and lightweight so it works offline and
-matches the deterministic evaluation flow (Option B).
+Notes:
+- This file keeps session state in an in-memory dict for fast local testing.
+  Replace with persistent storage (DB/Redis) for production.
+- Answer evaluation uses evaluate_answer_hybrid(...) from backend.services.mock_engine.
 """
 
-from fastapi import APIRouter, Body, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, Optional
 import uuid
 import time
-import re
+import logging
+from typing import Dict, List, Optional
+from fastapi import APIRouter, HTTPException, Body
 
-router = APIRouter()
+from pydantic import BaseModel
 
-# In-memory session store (reset on restart)
-_SESSIONS: Dict[str, Dict[str, Any]] = {}
+from backend.services.mock_engine import evaluate_answer_hybrid  # hybrid evaluator
+from backend.services.text_cleaner import clean_text
 
-# Simple question bank (extendable)
-_QUESTION_BANK = {
-    "frontend": [
-        "Explain the difference between CSS Grid and Flexbox and when you'd use each.",
-        "How do you optimize web page performance? Name 3 techniques.",
-        "What are web accessibility (a11y) best practices you follow?"
-    ],
-    "backend": [
-        "Explain database indexing and when to use it.",
-        "How do you design a scalable REST API?",
-        "Describe how you would debug memory leaks in a backend service."
-    ],
-    "general": [
-        "Tell me about a time you led a project and what the outcome was.",
-        "How do you prioritize tasks when everything is urgent?"
-    ]
-}
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/mock", tags=["Mock Interview"])
 
-# --- Simple deterministic evaluator ---
-def _evaluate_answer(answer: str) -> Dict[str, Any]:
-    """
-    Deterministic, reproducible scoring:
-      - word_count: reward sensible length (10-60 words)
-      - action_verbs: count of simple action verbs
-      - leadership: count of leadership keywords
-      - numbers: presence of digits (quantified)
-      - hedging: penalty for hedging words
-    Returns a dict with score 0-100 and details.
-    """
-    if not answer:
-        return {"score": 0, "metrics": {}, "feedback": "No answer provided."}
+# ----------------------------
+# Simple in-memory session store
+# ----------------------------
+# session structure:
+# {
+#   "id": session_id,
+#   "role": "frontend",
+#   "difficulty": "Medium",
+#   "question_count": 5,
+#   "resume_text": "...",
+#   "questions": [ {question_id, question_text, asked:bool} ... ],
+#   "history": [ {question_id, question_text, user_answer, evaluation, timestamp} ... ],
+#   "created_at": ts,
+#   "finished": False
+# }
+_SESSIONS: Dict[str, Dict] = {}
 
-    text = answer.strip()
-    words = re.findall(r"\w+", text)
-    word_count = len(words)
+# ----------------------------
+# Minimal question bank (fallback)
+# ----------------------------
+_DEFAULT_QUESTIONS = [
+    "Explain the difference between CSS Grid and Flexbox and when you'd use each.",
+    "Describe how the browser rendering pipeline works and how you'd optimize rendering performance.",
+    "How do you approach debugging a production issue that only happens intermittently?",
+    "Explain event delegation and why it's useful in large web applications.",
+    "Describe the differences between SQL and NoSQL databases and when you'd pick one over the other.",
+    "How would you design a system for uploading and processing large files from users?",
+    "Explain the lifecycle of a React component (or equivalent in your preferred frontend framework).",
+    "Describe a time you had to refactor code — what was your process and the outcome?"
+]
 
-    ACTIONS = ["developed","created","designed","built","implemented","improved","optimized","led","managed","launched","initiated","resolved","mentored","owned","spearheaded"]
-    LEADERSHIP = ["led","managed","supervised","owned","mentored","directed","coordinated"]
-    HEDGES = ["might","could","maybe","possibly","may","sometimes","can be"]
+# Utility: generate question objects (IDs)
+def _make_questions(role: str, count: int, difficulty: str) -> List[Dict]:
+    # For now we pick from default questions heuristically.
+    questions = []
+    # rotate through default list if count > len(list)
+    for i in range(count):
+        q_text = _DEFAULT_QUESTIONS[i % len(_DEFAULT_QUESTIONS)]
+        qid = str(uuid.uuid4())
+        questions.append({"question_id": qid, "question_text": q_text, "asked": False, "current_index": i+1, "total_questions": count})
+    return questions
 
-    action_count = sum(1 for v in ACTIONS if re.search(r"\b" + re.escape(v) + r"\b", text, flags=re.IGNORECASE))
-    lead_count = sum(1 for v in LEADERSHIP if re.search(r"\b" + re.escape(v) + r"\b", text, flags=re.IGNORECASE))
-    nums = len(re.findall(r"\d+", text))
-    hedge_count = sum(1 for v in HEDGES if re.search(r"\b" + re.escape(v) + r"\b", text, flags=re.IGNORECASE))
-
-    # Length score (0..25)
-    if word_count < 6:
-        length_score = 5
-    elif word_count <= 30:
-        length_score = 20
-    elif word_count <= 80:
-        length_score = 15
-    else:
-        length_score = 10
-
-    # Action verbs score (0..25)
-    action_score = min(25, action_count * 8)  # each action verb ≈ 8 points up to cap
-
-    # Leadership score (0..20)
-    lead_score = min(20, lead_count * 7)
-
-    # Quantified score (0..20)
-    quant_score = 20 if nums >= 1 else 0
-
-    # Hedging penalty (0..20)
-    hedge_penalty = min(15, hedge_count * 7)
-
-    raw = length_score + action_score + lead_score + quant_score - hedge_penalty
-    total = max(0, min(100, int(raw)))
-
-    strengths = []
-    weaknesses = []
-
-    if action_count:
-        strengths.append(f"Uses action verbs ({action_count}).")
-    if lead_count:
-        strengths.append(f"Leadership signals ({lead_count}).")
-    if nums:
-        strengths.append(f"Quantified evidence ({nums} number(s)).")
-    if word_count >= 6 and word_count <= 80:
-        strengths.append("Answer length is appropriate.")
-
-    if hedge_count:
-        weaknesses.append(f"Hedging language detected ({hedge_count}). Use assertive phrasing.")
-    if word_count < 6:
-        weaknesses.append("Answer too short — expand with structure (STAR).")
-    if word_count > 120:
-        weaknesses.append("Answer too long — be more concise and focused.")
-
-    feedback = f"Score: {total}/100 — length:{word_count}, action:{action_count}, leadership:{lead_count}, quantified:{nums}, hedging_penalty:{hedge_penalty}."
-
-    return {
-        "score": total,
-        "metrics": {
-            "word_count": word_count,
-            "action_verbs": action_count,
-            "leadership_mentions": lead_count,
-            "numeric_mentions": nums,
-            "hedging_count": hedge_count,
-            "raw_components": {
-                "length_score": length_score,
-                "action_score": action_score,
-                "leadership_score": lead_score,
-                "quantified_score": quant_score,
-                "hedging_penalty": hedge_penalty
-            }
-        },
-        "strengths": strengths,
-        "weaknesses": weaknesses,
-        "feedback": feedback
-    }
-
-# --- Pydantic models for clarity ---
+# ----------------------------
+# Request / Response models
+# ----------------------------
 class StartRequest(BaseModel):
     role: Optional[str] = "general"
     difficulty: Optional[str] = "Medium"
-    question_count: Optional[int] = 3
-    resume_id: Optional[str] = None
+    question_count: Optional[int] = 5
+    resume_text: Optional[str] = None  # optional parsed resume contents
 
 class SessionRef(BaseModel):
     session_id: str
 
-class AnswerPayload(BaseModel):
+class AnswerRequest(BaseModel):
     session_id: str
-    answer: Optional[str] = None
+    question_id: str
+    answer: str
 
-# --- Helper functions ---
-def _pick_question_for_role(role: str, idx: int) -> str:
-    bank = _QUESTION_BANK.get(role) or _QUESTION_BANK.get("general")
-    return bank[idx % len(bank)]
-
-# --- Routes (aliasing both /mock and /mock-v2 paths) ---
-
-# Start session
-@router.post("/mock/start")
-@router.post("/mock-v2/start")
-def start_session(payload: StartRequest = Body(...)):
-    sid = str(uuid.uuid4())
-    role = (payload.role or "general").lower()
-    qcount = max(1, payload.question_count or 3)
-    session = {
-        "session_id": sid,
-        "role": role,
-        "difficulty": payload.difficulty,
-        "question_count": qcount,
-        "created_at": time.time(),
-        "index": 0,
-        "history": [],  # list of {question_id, question_text, user_answer, evaluation}
-        "completed": False
-    }
-    _SESSIONS[sid] = session
-
-    first_q = _pick_question_for_role(role, 0)
-    return {
-        "status": "success",
-        "data": {
-            "session_id": sid,
-            "question": first_q,
-            "role": role
-        }
-    }
-
-# Fetch current question (by session_id provided in body)
-@router.post("/mock/question")
-@router.post("/mock-v2/question")
-def get_question(ref: SessionRef = Body(...)):
-    sid = ref.session_id
-    sess = _SESSIONS.get(sid)
-    if not sess:
+# ----------------------------
+# Helpers
+# ----------------------------
+def _get_session(session_id: str) -> Dict:
+    s = _SESSIONS.get(session_id)
+    if not s:
         raise HTTPException(status_code=404, detail="session not found")
-    if sess["completed"]:
-        return {"status": "completed"}
-    idx = sess["index"]
-    q_text = _pick_question_for_role(sess["role"], idx)
-    return {
-        "status": "success",
-        "data": {
-            "question_id": f"q-{idx}",
-            "question": q_text,
-            "current_index": idx + 1,
-            "total_questions": sess["question_count"]
-        }
-    }
+    return s
 
-# Submit answer
-@router.post("/mock/answer")
-@router.post("/mock-v2/answer")
-def submit_answer(payload: AnswerPayload = Body(...)):
-    sid = payload.session_id
-    sess = _SESSIONS.get(sid)
-    if not sess:
-        raise HTTPException(status_code=404, detail="session not found")
+def _pick_next_question(session: Dict) -> Optional[Dict]:
+    for q in session["questions"]:
+        if not q.get("asked"):
+            return q
+    return None
 
-    if sess["completed"]:
-        raise HTTPException(status_code=400, detail="session already completed")
-
-    idx = sess["index"]
-    q_text = _pick_question_for_role(sess["role"], idx)
-    evaluation = _evaluate_answer(payload.answer or "")
-
-    # store
-    entry = {
-        "question_id": f"q-{idx}",
-        "question": q_text,
-        "user_answer": payload.answer,
-        "evaluation": evaluation
-    }
-    sess["history"].append(entry)
-
-    # advance index
-    sess["index"] += 1
-    if sess["index"] >= sess["question_count"]:
-        sess["completed"] = True
-        next_q = None
-    else:
-        next_q = {
-            "question_id": f"q-{sess['index']}",
-            "question": _pick_question_for_role(sess["role"], sess["index"]),
-            "current_index": sess["index"] + 1,
-            "total_questions": sess["question_count"]
-        }
-
-    return {
-        "status": "success",
-        "data": {
-            "evaluation": evaluation,
-            "next_question": next_q,
-            "session_id": sid,
-            "history_count": len(sess["history"])
-        }
-    }
-
-# End / finish aliases (previously returning 404)
-@router.post("/mock/end")
-@router.post("/mock-v2/finish")
-@router.post("/mock-v2/end")
-def end_session(ref: SessionRef = Body(...)):
-    sid = ref.session_id
-    sess = _SESSIONS.get(sid)
-    if not sess:
-        raise HTTPException(status_code=404, detail="session not found")
-    sess["completed"] = True
-    return {"status": "success", "message": "session marked finished", "session_id": sid}
-
-# Results retrieval
-@router.get("/mock/{session_id}/results")
-@router.get("/mock-v2/{session_id}/results")
-def get_results(session_id: str):
-    sess = _SESSIONS.get(session_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="session not found")
-
-    # Build an aggregated report (simple deterministic aggregation)
-    history = sess["history"]
+def _summary_from_history(history: List[Dict]) -> Dict:
+    # Build a lightweight summary: average score and counts
     if not history:
-        overall = 0
-        dims = {}
-        feedback = {}
-    else:
-        scores = [entry["evaluation"]["score"] for entry in history]
-        overall = int(sum(scores) / len(scores))
-        # dimensions: average of metrics
-        dims = {}
-        # average each metric across history if present
-        metric_keys = ["word_count","action_verbs","leadership_mentions","numeric_mentions","hedging_count"]
-        accum = {k: 0 for k in metric_keys}
-        for entry in history:
-            m = entry["evaluation"].get("metrics", {})
-            for k in metric_keys:
-                accum[k] += m.get(k, 0)
-        dims = {k: int(accum[k]/len(history)) if len(history) else 0 for k in accum}
+        return {"questions_answered": 0, "avg_score": 0}
+    scores = [h.get("evaluation", {}).get("final_score", 0) for h in history if h.get("evaluation")]
+    avg = int(round(sum(scores) / len(scores))) if scores else 0
+    return {"questions_answered": len(history), "avg_score": avg, "scores": scores}
 
-        # Provide friendly feedback blocks
-        strengths = []
-        weaknesses = []
-        quick_wins = []
-        for entry in history:
-            ev = entry["evaluation"]
-            strengths.extend(ev.get("strengths", []))
-            weaknesses.extend(ev.get("weaknesses", []))
-            # one-line quick win based on missing quantification
-            if ev["metrics"].get("numeric_mentions", 0) == 0:
-                quick_wins.append({"title": "Add numbers", "description": "Quantify impact (%, $ or counts) in your answer."})
+# ----------------------------
+# Endpoints
+# ----------------------------
 
-        # dedupe and trim
-        strengths = list(dict.fromkeys(strengths))[:6]
-        weaknesses = list(dict.fromkeys(weaknesses))[:6]
-        quick_wins = quick_wins[:6]
+@router.post("/start")
+def start_session(req: StartRequest = Body(...)):
+    # Basic validation & cleaning
+    role = (req.role or "general").strip()
+    difficulty = (req.difficulty or "Medium").strip()
+    qcount = max(1, min(12, int(req.question_count or 5)))  # clamp
+    resume_text = clean_text(req.resume_text or "", redact=False)
 
-        feedback = {
-            "strengths": strengths,
-            "weaknesses": weaknesses,
-            "summary": f"Average score across {len(history)} answers: {overall}/100",
-            "quick_wins": quick_wins
-        }
+    session_id = str(uuid.uuid4())
+    questions = _make_questions(role, qcount, difficulty)
 
-    # transcript
-    transcript = []
-    for e in history:
-        transcript.append({
-            "question": e["question"],
-            "user_answer": e.get("user_answer"),
-            "feedback": e["evaluation"].get("feedback"),
-            # "improved_answer" not generated by deterministic engine; placeholder
-            "improved_answer": e.get("user_answer") or ""
-        })
-
-    return {
-        "status": "success",
-        "data": {
-            "session_id": session_id,
-            "overall_score": overall,
-            "dimensions": dims,
-            "feedback": feedback,
-            "transcript": transcript
-        }
+    session = {
+        "id": session_id,
+        "role": role,
+        "difficulty": difficulty,
+        "question_count": qcount,
+        "resume_text": resume_text,
+        "questions": questions,
+        "history": [],
+        "created_at": time.time(),
+        "finished": False
     }
+    _SESSIONS[session_id] = session
+
+    # return first question immediately for a smooth UX
+    first_q = _pick_next_question(session)
+    if first_q:
+        # mark it asked (server-driven)
+        first_q["asked"] = True
+        resp = {"session_id": session_id, "question": first_q["question_text"], "question_id": first_q["question_id"], "role": role}
+    else:
+        resp = {"session_id": session_id, "question": None, "role": role}
+
+    return {"status": "success", "data": resp}
+
+
+@router.post("/question")
+def get_question(ref: SessionRef = Body(...)):
+    session = _get_session(ref.session_id)
+    # find next unasked
+    nxt = _pick_next_question(session)
+    if not nxt:
+        # no more questions
+        return {"status": "completed", "data": {"message": "No more questions"}}
+    # mark as asked and return
+    nxt["asked"] = True
+    return {"status": "success", "data": {"question_id": nxt["question_id"], "question": nxt["question_text"], "current_index": nxt.get("current_index", 0), "total_questions": nxt.get("total_questions", session["question_count"]) }}
+
+
+@router.post("/answer")
+def submit_answer(payload: AnswerRequest = Body(...)):
+    session = _get_session(payload.session_id)
+    qid = payload.question_id
+    user_answer = (payload.answer or "").strip()
+
+    # find question object
+    qobj = next((q for q in session["questions"] if q["question_id"] == qid), None)
+    if not qobj:
+        raise HTTPException(status_code=404, detail="question not found in session")
+
+    # Save a raw entry with timestamp (before evaluation) for audit
+    entry = {
+        "question_id": qid,
+        "question_text": qobj.get("question_text"),
+        "user_answer": user_answer,
+        "timestamp": time.time(),
+        "evaluation": None
+    }
+
+    # Run hybrid evaluation (deterministic + optional LLM). Keep it safe & bounded.
+    try:
+        eval_cfg = {
+            "enable_llm": True,               # flip to False to force deterministic only
+            "min_llm_confidence": 0.18,
+            "min_word_count_for_llm": 6,
+            "llm_timeout": 10
+        }
+        eval_result = evaluate_answer_hybrid(qobj.get("question_text"), user_answer, resume_text=session.get("resume_text"), config=eval_cfg)
+    except Exception as e:
+        logger.exception("Evaluation failed; falling back to deterministic summary: %s", e)
+        # If evaluation failed catastrophically, provide a safe deterministic placeholder
+        eval_result = {
+            "final_method": "error",
+            "final_score": 0,
+            "deterministic": {},
+            "llm": None
+        }
+
+    entry["evaluation"] = eval_result
+    session["history"].append(entry)
+
+    # Prepare next question or mark completed
+    next_q = _pick_next_question(session)
+    if next_q:
+        next_q["asked"] = True
+        next_payload = {"question_id": next_q["question_id"], "question": next_q["question_text"], "current_index": next_q.get("current_index", 0), "total_questions": next_q.get("total_questions", session["question_count"])}
+    else:
+        next_payload = {"status": "completed", "message": "No further questions. Call /mock/end to finish and get results."}
+
+    # Response shape: includes evaluation + next question
+    return {"status": "success", "data": {"evaluation": eval_result, "next_question": next_payload, "session_id": session["id"], "history_count": len(session["history"]) }}
+
+
+@router.post("/end")
+def end_session(ref: SessionRef = Body(...)):
+    session = _get_session(ref.session_id)
+    session["finished"] = True
+    # Optionally run any final aggregation or post-processing here (e.g. generate rewrites via LLM)
+    summary = _summary_from_history(session["history"])
+    return {"status": "success", "data": {"session_id": session["id"], "summary": summary, "total_answered": len(session["history"]) }}
+
+
+@router.get("/results/{session_id}")
+def get_results(session_id: str):
+    session = _get_session(session_id)
+    # Build a sanitized results payload
+    results = {
+        "session_id": session["id"],
+        "role": session["role"],
+        "difficulty": session["difficulty"],
+        "created_at": session["created_at"],
+        "finished": session["finished"],
+        "history": session["history"],
+        "summary": _summary_from_history(session["history"])
+    }
+    return {"status": "success", "data": results}
