@@ -1,340 +1,344 @@
 # backend/routers/mock_v2.py
 """
-Mock Interview Router (v2)
---------------------------
+Compatibility router for Mock Interview endpoints.
 
-Provides a deterministic, safe, and fast mock-interview flow for Phase 1.
-This router avoids calling LLMs and instead uses simple heuristics to evaluate answers:
- - length (word count)
- - presence of action verbs
- - leadership/ownership keywords
- - quantified achievements (numbers)
-All evaluations are deterministic and explainable (suitable for UI flows and tests).
+Provides:
+ - POST /mock/start and POST /mock-v2/start
+ - POST /mock/question and POST /mock-v2/question
+ - POST /mock/answer and POST /mock-v2/answer
+ - POST /mock/end and POST /mock-v2/finish (aliases)
+ - GET  /mock/{session_id}/results and /mock-v2/{session_id}/results
 
-Sessions are stored in-memory (SESSIONS). For production you should persist sessions in a DB.
+This is intentionally deterministic and lightweight so it works offline and
+matches the deterministic evaluation flow (Option B).
 """
 
-import time
-import uuid
-from typing import Dict, Any, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel
+from typing import Dict, Any, Optional
+import uuid
+import time
+import re
 
+router = APIRouter()
 
+# In-memory session store (reset on restart)
+_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-# Question bank utilities (ensure this module exists: backend/services/mock/question_bank.py)
-try:
-    from backend.services.mock.question_bank import get_random_question, get_question_by_id
-except Exception:
-    # If missing, provide helpful error at import time so developer sees the issue
-    raise
-
-router = APIRouter(prefix="/mock", tags=["Mock Interviews (v2)"])
-
-# In-memory session store (session_id -> session data)
-# session data schema:
-# {
-#   "role": str,
-#   "created_at": float,
-#   "last_question": { "id": str, "question": str },
-#   "asked": [ { "id": str, "question": str, "answer": str, "score": int, "meta": {...} } ],
-#   "use_llm": bool
-# }
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-# --- Request/Response models ---
-class StartReq(BaseModel):
-    role: str
-    use_llm: Optional[bool] = False  # reserved for later hybrid mode
-
-class StartResp(BaseModel):
-    status: str
-    data: Dict[str, Any]
-
-class SessionIdReq(BaseModel):
-    session_id: str
-
-class AnswerReq(BaseModel):
-    session_id: str
-    answer: str
-
-class QuestionResp(BaseModel):
-    status: str
-    data: Dict[str, Any]
-
-class EvalResult(BaseModel):
-    score: int
-    strengths: list
-    weaknesses: list
-    feedback: str
-    metrics: dict
-
-# --- Deterministic evaluation helpers ---
-ACTION_VERBS = {
-    "developed","created","designed","built","implemented","improved","optimized",
-    "led","managed","launched","initiated","enhanced","engineered","resolved",
-    "coordinated","executed","drove","streamlined","automated","owned","mentored",
-    "supervised","directed","spearheaded","orchestrated"
+# Simple question bank (extendable)
+_QUESTION_BANK = {
+    "frontend": [
+        "Explain the difference between CSS Grid and Flexbox and when you'd use each.",
+        "How do you optimize web page performance? Name 3 techniques.",
+        "What are web accessibility (a11y) best practices you follow?"
+    ],
+    "backend": [
+        "Explain database indexing and when to use it.",
+        "How do you design a scalable REST API?",
+        "Describe how you would debug memory leaks in a backend service."
+    ],
+    "general": [
+        "Tell me about a time you led a project and what the outcome was.",
+        "How do you prioritize tasks when everything is urgent?"
+    ]
 }
 
-LEADERSHIP_KEYWORDS = {"led","managed","supervised","owned","mentored","directed","coordinated","spearheaded"}
-
-HEDGING_WORDS = {"maybe","might","could","possibly","sometimes","may","might've"}
-
-def _word_tokens(text: str):
-    return [t.strip(".,;:()[]{}\"'") for t in text.split() if t.strip()]
-
-def _count_numbers(text: str) -> int:
-    # simple numeric token detection
-    tokens = _word_tokens(text)
-    cnt = 0
-    for t in tokens:
-        # contains digits like "3", "3+", "20%"
-        if any(ch.isdigit() for ch in t):
-            cnt += 1
-    return cnt
-
-def _count_action_verbs(text: str) -> int:
-    t = text.lower()
-    cnt = 0
-    for v in ACTION_VERBS:
-        if f" {v} " in f" {t} " or t.startswith(v + " ") or t.endswith(" " + v):
-            cnt += t.count(v)
-    return cnt
-
-def _count_leadership(text: str) -> int:
-    t = text.lower()
-    cnt = 0
-    for v in LEADERSHIP_KEYWORDS:
-        if f" {v} " in f" {t} " or t.startswith(v + " ") or t.endswith(" " + v):
-            cnt += t.count(v)
-    return cnt
-
-def _count_hedging(text: str) -> int:
-    t = text.lower()
-    cnt = 0
-    for w in HEDGING_WORDS:
-        if f" {w} " in f" {t} ":
-            cnt += 1
-    return cnt
-
-def deterministic_evaluate(answer: str) -> Dict[str, Any]:
+# --- Simple deterministic evaluator ---
+def _evaluate_answer(answer: str) -> Dict[str, Any]:
     """
-    Deterministic scoring:
-      - baseline length_score (0..40) based on word count
-      - action_score (0..25) based on action verb density
-      - leadership_score (0..20) for leadership words/ownership signals
-      - quantified_score (0..15) for presence of numeric achievements
-      - hedging_penalty (- up to 10)
-    Final score is clipped to 0..100.
-
-    Returns dict containing score, metrics, strengths, weaknesses, and short feedback.
+    Deterministic, reproducible scoring:
+      - word_count: reward sensible length (10-60 words)
+      - action_verbs: count of simple action verbs
+      - leadership: count of leadership keywords
+      - numbers: presence of digits (quantified)
+      - hedging: penalty for hedging words
+    Returns a dict with score 0-100 and details.
     """
-    if not answer or not answer.strip():
-        return {
-            "score": 0,
-            "metrics": {},
-            "strengths": [],
-            "weaknesses": ["No answer provided."],
-            "feedback": "No answer submitted."
-        }
+    if not answer:
+        return {"score": 0, "metrics": {}, "feedback": "No answer provided."}
 
-    tokens = _word_tokens(answer)
-    word_count = len(tokens)
-    num_count = _count_numbers(answer)
-    action_count = _count_action_verbs(answer)
-    lead_count = _count_leadership(answer)
-    hedge_count = _count_hedging(answer)
+    text = answer.strip()
+    words = re.findall(r"\w+", text)
+    word_count = len(words)
 
-    # 1. Length (words) — encourage 20-120 words (concise but informative)
-    if word_count < 15:
-        length_score = int(max(0, (word_count / 15) * 20))  # up to 20
-    elif word_count <= 80:
-        # full credit in middle range
+    ACTIONS = ["developed","created","designed","built","implemented","improved","optimized","led","managed","launched","initiated","resolved","mentored","owned","spearheaded"]
+    LEADERSHIP = ["led","managed","supervised","owned","mentored","directed","coordinated"]
+    HEDGES = ["might","could","maybe","possibly","may","sometimes","can be"]
+
+    action_count = sum(1 for v in ACTIONS if re.search(r"\b" + re.escape(v) + r"\b", text, flags=re.IGNORECASE))
+    lead_count = sum(1 for v in LEADERSHIP if re.search(r"\b" + re.escape(v) + r"\b", text, flags=re.IGNORECASE))
+    nums = len(re.findall(r"\d+", text))
+    hedge_count = sum(1 for v in HEDGES if re.search(r"\b" + re.escape(v) + r"\b", text, flags=re.IGNORECASE))
+
+    # Length score (0..25)
+    if word_count < 6:
+        length_score = 5
+    elif word_count <= 30:
         length_score = 20
+    elif word_count <= 80:
+        length_score = 15
     else:
-        # slightly penalize very long answers
-        length_score = int(max(10, 20 - ((word_count - 80) / 40) * 10))  # not harsh
+        length_score = 10
 
-    # 2. Action verbs density (action_count per 10 sentences/phrases)
-    action_score = int(min(25, action_count * 5))  # each action verb gives 5 points up to 25
+    # Action verbs score (0..25)
+    action_score = min(25, action_count * 8)  # each action verb ≈ 8 points up to cap
 
-    # 3. Leadership/ownership
-    leadership_score = int(min(20, lead_count * 7))  # each mention gives ~7 pts up to 20
+    # Leadership score (0..20)
+    lead_score = min(20, lead_count * 7)
 
-    # 4. Quantified achievements
-    quantified_score = int(min(15, num_count * 6))  # each numeric mention up to cap
+    # Quantified score (0..20)
+    quant_score = 20 if nums >= 1 else 0
 
-    # 5. Hedging penalty
-    hedging_penalty = int(min(10, hedge_count * 5))  # each hedging occurrence penalizes
+    # Hedging penalty (0..20)
+    hedge_penalty = min(15, hedge_count * 7)
 
-    raw = length_score + action_score + leadership_score + quantified_score - hedging_penalty
-    score = int(max(0, min(100, raw)))
+    raw = length_score + action_score + lead_score + quant_score - hedge_penalty
+    total = max(0, min(100, int(raw)))
 
-    # Build explanations (strengths/weaknesses)
     strengths = []
     weaknesses = []
-    if action_count > 0:
+
+    if action_count:
         strengths.append(f"Uses action verbs ({action_count}).")
-    if lead_count > 0:
-        strengths.append(f"Shows leadership/ownership ({lead_count}).")
-    if num_count > 0:
-        strengths.append(f"Provides quantified evidence ({num_count} numbers).")
-    if 15 <= word_count <= 120:
+    if lead_count:
+        strengths.append(f"Leadership signals ({lead_count}).")
+    if nums:
+        strengths.append(f"Quantified evidence ({nums} number(s)).")
+    if word_count >= 6 and word_count <= 80:
         strengths.append("Answer length is appropriate.")
 
-    if word_count < 15:
-        weaknesses.append("Answer is short — expand with a concise example or result.")
-    if action_count == 0:
-        weaknesses.append("No clear action verbs — start bullets/sentences with strong verbs.")
-    if lead_count == 0:
-        weaknesses.append("No leadership/ownership signals detected — mention responsibility where relevant.")
-    if num_count == 0:
-        weaknesses.append("No quantified impact — add numbers (%) or metrics if possible.")
-    if hedge_count > 0:
-        weaknesses.append("Hedging words detected — prefer confident, outcome-focused language.")
+    if hedge_count:
+        weaknesses.append(f"Hedging language detected ({hedge_count}). Use assertive phrasing.")
+    if word_count < 6:
+        weaknesses.append("Answer too short — expand with structure (STAR).")
+    if word_count > 120:
+        weaknesses.append("Answer too long — be more concise and focused.")
 
-    # Short actionable feedback
-    feedback_lines = []
-    feedback_lines.append(f"Score: {score}/100 — length:{length_score}, action:{action_score}, leadership:{leadership_score}, quantified:{quantified_score}, hedging_penalty:{hedging_penalty}.")
-    if strengths:
-        feedback_lines.append("Strengths: " + "; ".join(strengths))
-    if weaknesses:
-        feedback_lines.append("Opportunities: " + "; ".join(weaknesses[:3]))
-    feedback = " ".join(feedback_lines)
-
-    metrics = {
-        "word_count": word_count,
-        "action_verbs": action_count,
-        "leadership_mentions": lead_count,
-        "numeric_mentions": num_count,
-        "hedging_count": hedge_count,
-        "raw_components": {
-            "length_score": length_score,
-            "action_score": action_score,
-            "leadership_score": leadership_score,
-            "quantified_score": quantified_score,
-            "hedging_penalty": hedging_penalty
-        }
-    }
+    feedback = f"Score: {total}/100 — length:{word_count}, action:{action_count}, leadership:{lead_count}, quantified:{nums}, hedging_penalty:{hedge_penalty}."
 
     return {
-        "score": score,
-        "metrics": metrics,
+        "score": total,
+        "metrics": {
+            "word_count": word_count,
+            "action_verbs": action_count,
+            "leadership_mentions": lead_count,
+            "numeric_mentions": nums,
+            "hedging_count": hedge_count,
+            "raw_components": {
+                "length_score": length_score,
+                "action_score": action_score,
+                "leadership_score": lead_score,
+                "quantified_score": quant_score,
+                "hedging_penalty": hedge_penalty
+            }
+        },
         "strengths": strengths,
         "weaknesses": weaknesses,
         "feedback": feedback
     }
 
-# --- Router endpoints ---
-@router.post("/start", response_model=StartResp)
-def start_mock(req: StartReq):
-    """
-    Start a new mock interview session for a given role.
-    Returns session_id and initial question.
-    """
-    role = (req.role or "").strip()
-    if not role:
-        raise HTTPException(status_code=400, detail="Role is required.")
+# --- Pydantic models for clarity ---
+class StartRequest(BaseModel):
+    role: Optional[str] = "general"
+    difficulty: Optional[str] = "Medium"
+    question_count: Optional[int] = 3
+    resume_id: Optional[str] = None
 
-    q = get_random_question(role)
-    if not q:
-        raise HTTPException(status_code=404, detail="No questions available for that role.")
+class SessionRef(BaseModel):
+    session_id: str
 
-    session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = {
+class AnswerPayload(BaseModel):
+    session_id: str
+    answer: Optional[str] = None
+
+# --- Helper functions ---
+def _pick_question_for_role(role: str, idx: int) -> str:
+    bank = _QUESTION_BANK.get(role) or _QUESTION_BANK.get("general")
+    return bank[idx % len(bank)]
+
+# --- Routes (aliasing both /mock and /mock-v2 paths) ---
+
+# Start session
+@router.post("/mock/start")
+@router.post("/mock-v2/start")
+def start_session(payload: StartRequest = Body(...)):
+    sid = str(uuid.uuid4())
+    role = (payload.role or "general").lower()
+    qcount = max(1, payload.question_count or 3)
+    session = {
+        "session_id": sid,
         "role": role,
+        "difficulty": payload.difficulty,
+        "question_count": qcount,
         "created_at": time.time(),
-        "last_question": {"id": q.get("id"), "question": q.get("question")},
-        "asked": [],
-        "use_llm": bool(req.use_llm)
+        "index": 0,
+        "history": [],  # list of {question_id, question_text, user_answer, evaluation}
+        "completed": False
+    }
+    _SESSIONS[sid] = session
+
+    first_q = _pick_question_for_role(role, 0)
+    return {
+        "status": "success",
+        "data": {
+            "session_id": sid,
+            "question": first_q,
+            "role": role
+        }
     }
 
-    return {"status": "success", "data": {"session_id": session_id, "question": q.get("question"), "role": role}}
+# Fetch current question (by session_id provided in body)
+@router.post("/mock/question")
+@router.post("/mock-v2/question")
+def get_question(ref: SessionRef = Body(...)):
+    sid = ref.session_id
+    sess = _SESSIONS.get(sid)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    if sess["completed"]:
+        return {"status": "completed"}
+    idx = sess["index"]
+    q_text = _pick_question_for_role(sess["role"], idx)
+    return {
+        "status": "success",
+        "data": {
+            "question_id": f"q-{idx}",
+            "question": q_text,
+            "current_index": idx + 1,
+            "total_questions": sess["question_count"]
+        }
+    }
 
-
-@router.post("/question", response_model=QuestionResp)
-def get_question(payload: SessionIdReq):
-    """
-    Return the last question for the session or a fresh question if the session exists but no last_question.
-    """
+# Submit answer
+@router.post("/mock/answer")
+@router.post("/mock-v2/answer")
+def submit_answer(payload: AnswerPayload = Body(...)):
     sid = payload.session_id
-    sess = SESSIONS.get(sid)
+    sess = _SESSIONS.get(sid)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
 
-    # If last_question exists, return it
-    last = sess.get("last_question")
-    if last and last.get("question"):
-        return {"status": "success", "data": {"question_id": last.get("id"), "question": last.get("question")}}
+    if sess["completed"]:
+        raise HTTPException(status_code=400, detail="session already completed")
 
-    # Else fetch new question and attach
-    q = get_random_question(sess.get("role"))
-    sess["last_question"] = {"id": q.get("id"), "question": q.get("question")}
-    return {"status": "success", "data": {"question_id": q.get("id"), "question": q.get("question")}}
+    idx = sess["index"]
+    q_text = _pick_question_for_role(sess["role"], idx)
+    evaluation = _evaluate_answer(payload.answer or "")
 
-
-@router.post("/answer")
-def submit_answer(payload: AnswerReq):
-    """
-    Submit an answer to the current question. Returns deterministic evaluation and a next question.
-    """
-    sid = payload.session_id
-    ans = payload.answer or ""
-    sess = SESSIONS.get(sid)
-    if not sess:
-        raise HTTPException(status_code=404, detail="session not found")
-
-    last = sess.get("last_question")
-    if not last or not last.get("id"):
-        # fetch a question first
-        q = get_random_question(sess.get("role"))
-        sess["last_question"] = {"id": q.get("id"), "question": q.get("question")}
-        last = sess["last_question"]
-
-    # Evaluate deterministically
-    eval_out = deterministic_evaluate(ans)
-
-    # Record asked item
-    record = {
-        "id": last.get("id"),
-        "question": last.get("question"),
-        "answer": ans,
-        "score": int(eval_out["score"]),
-        "meta": eval_out["metrics"],
-        "evaluated_at": time.time()
+    # store
+    entry = {
+        "question_id": f"q-{idx}",
+        "question": q_text,
+        "user_answer": payload.answer,
+        "evaluation": evaluation
     }
-    sess.setdefault("asked", []).append(record)
+    sess["history"].append(entry)
 
-    # Prepare next question (do not reuse same question back-to-back)
-    next_q = get_random_question(sess.get("role"))
-    # Try a few times to avoid immediate repeat
-    tries = 0
-    while next_q.get("id") == last.get("id") and tries < 6:
-        next_q = get_random_question(sess.get("role"))
-        tries += 1
-    sess["last_question"] = {"id": next_q.get("id"), "question": next_q.get("question")}
+    # advance index
+    sess["index"] += 1
+    if sess["index"] >= sess["question_count"]:
+        sess["completed"] = True
+        next_q = None
+    else:
+        next_q = {
+            "question_id": f"q-{sess['index']}",
+            "question": _pick_question_for_role(sess["role"], sess["index"]),
+            "current_index": sess["index"] + 1,
+            "total_questions": sess["question_count"]
+        }
 
     return {
         "status": "success",
         "data": {
-            "evaluation": {
-                "score": eval_out["score"],
-                "strengths": eval_out["strengths"],
-                "weaknesses": eval_out["weaknesses"],
-                "feedback": eval_out["feedback"],
-                "metrics": eval_out["metrics"]
-            },
-            "next_question": {"question_id": next_q.get("id"), "question": next_q.get("question")},
+            "evaluation": evaluation,
+            "next_question": next_q,
             "session_id": sid,
-            "history_count": len(sess.get("asked", []))
+            "history_count": len(sess["history"])
         }
     }
 
-# small utility endpoint (optional) to inspect session (dev-only)
-@router.get("/session/{session_id}")
-def inspect_session(session_id: str):
-    sess = SESSIONS.get(session_id)
+# End / finish aliases (previously returning 404)
+@router.post("/mock/end")
+@router.post("/mock-v2/finish")
+@router.post("/mock-v2/end")
+def end_session(ref: SessionRef = Body(...)):
+    sid = ref.session_id
+    sess = _SESSIONS.get(sid)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    return {"status": "success", "data": sess}
+    sess["completed"] = True
+    return {"status": "success", "message": "session marked finished", "session_id": sid}
+
+# Results retrieval
+@router.get("/mock/{session_id}/results")
+@router.get("/mock-v2/{session_id}/results")
+def get_results(session_id: str):
+    sess = _SESSIONS.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    # Build an aggregated report (simple deterministic aggregation)
+    history = sess["history"]
+    if not history:
+        overall = 0
+        dims = {}
+        feedback = {}
+    else:
+        scores = [entry["evaluation"]["score"] for entry in history]
+        overall = int(sum(scores) / len(scores))
+        # dimensions: average of metrics
+        dims = {}
+        # average each metric across history if present
+        metric_keys = ["word_count","action_verbs","leadership_mentions","numeric_mentions","hedging_count"]
+        accum = {k: 0 for k in metric_keys}
+        for entry in history:
+            m = entry["evaluation"].get("metrics", {})
+            for k in metric_keys:
+                accum[k] += m.get(k, 0)
+        dims = {k: int(accum[k]/len(history)) if len(history) else 0 for k in accum}
+
+        # Provide friendly feedback blocks
+        strengths = []
+        weaknesses = []
+        quick_wins = []
+        for entry in history:
+            ev = entry["evaluation"]
+            strengths.extend(ev.get("strengths", []))
+            weaknesses.extend(ev.get("weaknesses", []))
+            # one-line quick win based on missing quantification
+            if ev["metrics"].get("numeric_mentions", 0) == 0:
+                quick_wins.append({"title": "Add numbers", "description": "Quantify impact (%, $ or counts) in your answer."})
+
+        # dedupe and trim
+        strengths = list(dict.fromkeys(strengths))[:6]
+        weaknesses = list(dict.fromkeys(weaknesses))[:6]
+        quick_wins = quick_wins[:6]
+
+        feedback = {
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "summary": f"Average score across {len(history)} answers: {overall}/100",
+            "quick_wins": quick_wins
+        }
+
+    # transcript
+    transcript = []
+    for e in history:
+        transcript.append({
+            "question": e["question"],
+            "user_answer": e.get("user_answer"),
+            "feedback": e["evaluation"].get("feedback"),
+            # "improved_answer" not generated by deterministic engine; placeholder
+            "improved_answer": e.get("user_answer") or ""
+        })
+
+    return {
+        "status": "success",
+        "data": {
+            "session_id": session_id,
+            "overall_score": overall,
+            "dimensions": dims,
+            "feedback": feedback,
+            "transcript": transcript
+        }
+    }
