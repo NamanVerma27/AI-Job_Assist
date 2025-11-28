@@ -53,7 +53,7 @@ class Education(Base):
     __tablename__ = "education"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignForeignKey("users.id"))
+    user_id = Column(Integer, ForeignKey("users.id"))  # <-- FIXED HERE
     school = Column(String)
     degree = Column(String)
     year = Column(String)

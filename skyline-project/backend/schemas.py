@@ -1,10 +1,13 @@
 # backend/schemas.py
 from pydantic import BaseModel, Field
 from typing import List, Optional
+from typing import Any, Dict
 from datetime import datetime
 
 
-# --- Phase 0: New Nested Schemas ---
+# ============================================================
+# Phase 0: Nested Schemas (Pydantic v2 model_config)
+# ============================================================
 
 class ExperienceBase(BaseModel):
     title: str
@@ -13,8 +16,7 @@ class ExperienceBase(BaseModel):
     end_date: Optional[str] = None
     description: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class EducationBase(BaseModel):
@@ -22,8 +24,7 @@ class EducationBase(BaseModel):
     degree: str
     year: str
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ProjectBase(BaseModel):
@@ -32,8 +33,7 @@ class ProjectBase(BaseModel):
     description: str
     link: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class ResumeMetadata(BaseModel):
@@ -43,13 +43,14 @@ class ResumeMetadata(BaseModel):
     parsing_status: str
     primary_flag: bool
     note: Optional[str] = None
-    content: Optional[str] = None  # <--- NEW FIELD
+    content: Optional[str] = None  # NEW FIELD
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
-# --- Main Profile Schema ---
+# ============================================================
+# Main Profile Schema
+# ============================================================
 
 class UserProfileV2(BaseModel):
     full_name: str
@@ -58,17 +59,18 @@ class UserProfileV2(BaseModel):
     linkedin: Optional[str] = None
     location: Optional[str] = None
     bio: Optional[str] = None
-    skills: Optional[str] = None  # Keep as string for simple tag input
+    skills: Optional[str] = None
 
     experience: List[ExperienceBase] = Field(default_factory=list)
     education: List[EducationBase] = Field(default_factory=list)
     projects: List[ProjectBase] = Field(default_factory=list)
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
-# --- Legacy Schema (Keep for compatibility) ---
+# ============================================================
+# Legacy Schema (Keep for compatibility)
+# ============================================================
 
 class Job(BaseModel):
     id: str
@@ -79,23 +81,24 @@ class Job(BaseModel):
     source: str
     posted_date: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class UserProfile(BaseModel):
-    fullName: str  # Frontend uses camelCase currently
+    # Frontend currently expects camelCase keys for legacy endpoints
+    fullName: str
     email: str
     phone: Optional[str] = None
     linkedin: Optional[str] = None
     skills: Optional[str] = None
 
-    class Config:
-        extra = "allow"
-        orm_mode = True
+    # Allow extra fields (keeps compatibility with older frontend payloads)
+    model_config = {"from_attributes": True, "extra": "allow"}
 
 
-# --- Mock Interview V2 Schemas ---
+# ============================================================
+# Mock Interview V2 Schemas
+# ============================================================
 
 class InterviewSetupRequest(BaseModel):
     target_role: str
@@ -104,8 +107,7 @@ class InterviewSetupRequest(BaseModel):
     question_count: int = 5
     resume_id: Optional[int] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class InterviewExchangeRead(BaseModel):
@@ -119,8 +121,7 @@ class InterviewExchangeRead(BaseModel):
     score_clarity: Optional[int] = None
     score_confidence: Optional[int] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class InterviewSessionRead(BaseModel):
@@ -135,7 +136,7 @@ class InterviewSessionRead(BaseModel):
     resume_id: Optional[int] = None
     created_at: Optional[datetime] = None
 
-    # Final scores (may be null until completion)
+    # Final scores
     overall_score: Optional[int] = None
     technical_score: Optional[int] = None
     communication_score: Optional[int] = None
@@ -143,8 +144,7 @@ class InterviewSessionRead(BaseModel):
     impact_score: Optional[int] = None
     behavioral_score: Optional[int] = None
 
-    # Optional: small preview of feedback (keeps payload small)
-    feedback_preview: Optional[dict] = None
+    # FIXED: pydantic-v2 safe type
+    feedback_preview: Optional[dict[str, Any]] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
