@@ -423,7 +423,17 @@ export default function AtsResult() {
   const needsToShow = Array.isArray(report.enhanced_quick_wins) ? report.enhanced_quick_wins : needsAttentionRaw;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-[#EEF3FF] to-[#F9FAFF] py-10 px-6">
+    <div
+      className="min-h-screen py-12 px-6 rounded-[18px] overflow-hidden"
+      style={{
+        background: `
+          radial-gradient(900px 500px at 8% 8%, rgba(145, 165, 245, 0.55), transparent 65%),
+          radial-gradient(900px 500px at 92% 22%, rgba(170, 195, 255, 0.50), transparent 65%),
+          linear-gradient(135deg, #DCE4FF 0%, #EAF0FF 45%, #FFFFFF 100%)
+        `
+      }}
+>
+
       <div className="max-w-6xl mx-auto space-y-10">
         <button onClick={() => navigate("/ats")} className="inline-flex items-center gap-2 text-gray-600 hover:text-indigo-600">
           <FaArrowLeft /> Back to ATS Checker

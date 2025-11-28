@@ -5,6 +5,7 @@ from backend.database import engine, Base
 
 # Routers
 from backend.routers import ai, jobs, resume, profile
+from backend.routers import mock_v2
 from backend.routers import ai_enhance  # <-- NEW: AI enhancement (with alias)
 
 # Environment
@@ -41,6 +42,7 @@ app.include_router(ai.router)
 app.include_router(jobs.router)
 app.include_router(resume.router)
 app.include_router(profile.router)
+app.include_router(mock_v2.router)
 
 # AI ATS Enhancement
 app.include_router(ai_enhance.router)        # Correct route → /api/ai/enhance-ats
