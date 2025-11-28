@@ -1,6 +1,7 @@
 import os
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pathlib import Path
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Skyline API"
@@ -23,8 +24,9 @@ class Settings(BaseSettings):
     ADZUNA_APP_KEY: str = "1cd0cedb7c75a925aa696a54611ad4a4"
 
     class Config:
-        env_file = ".env"
-        extra = "ignore" # Ignore extra env vars to prevent validation errors
+        # Use absolute path to backend/.env so Settings loads it regardless of CWD
+        env_file = str(Path(__file__).resolve().parent / ".env")
+        extra = "ignore"  # Ignore extra env vars to prevent validation errors
 
 @lru_cache()
 def get_settings():

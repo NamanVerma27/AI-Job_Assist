@@ -8,6 +8,10 @@ import json
 
 logger = logging.getLogger("mock_service")
 
+SAFE_Q = "I'm unable to generate the next question right now."
+SAFE_FEEDBACK = "Unable to analyze your answer."
+SAFE_IMPROVED = "No improved answer available."
+
 
 class MockService:
 
@@ -24,24 +28,20 @@ class MockService:
         if not session:
             return None
 
-        # End if already completed
         if session.current_question_index >= session.total_questions:
             session.status = "completed"
             db.commit()
             return {"status": "completed"}
 
-        # Generate AI question
         prompt = (
             f"Role: {session.target_role}, "
             f"Difficulty: {session.difficulty}, "
             f"Question Number: {session.current_question_index + 1}"
         )
 
-        question_text = LLMEngine.generate_response(
-            prompt, task_type="generate_question"
-        )
+        raw = LLMEngine.generate_response(prompt, task_type="generate_question")
+        question_text = raw.strip() if raw else SAFE_Q
 
-        # Save exchange
         exchange = models.InterviewExchange(
             session_id=session.id,
             question_order=session.current_question_index + 1,
@@ -49,7 +49,6 @@ class MockService:
         )
         db.add(exchange)
 
-        # Update session
         session.current_question_index += 1
         session.status = "in_progress"
         db.commit()
@@ -76,38 +75,27 @@ class MockService:
         if not exchange:
             return None
 
-        # Save answer
-        exchange.user_answer = user_answer.strip() if user_answer else ""
+        ua = (user_answer or "").strip()
+        exchange.user_answer = ua
 
-        # Micro-feedback
-        prompt = (
-            f"Question: {exchange.question_text}\n"
-            f"Answer: {exchange.user_answer}"
-        )
-        feedback = LLMEngine.generate_response(
-            prompt, task_type="evaluate_answer"
-        )
+        prompt = f"Question: {exchange.question_text}\nAnswer: {ua}"
+
+        raw = LLMEngine.generate_response(prompt, task_type="evaluate_answer")
+        feedback = raw.strip() if raw else SAFE_FEEDBACK
         exchange.ai_feedback = feedback
 
-        # ---------------------------------------------------------
-        # ATOMIC SCORING (deterministic fallback)
-        # ---------------------------------------------------------
-        ans = exchange.user_answer.lower()
-
-        def word_count(s):
-            return len(s.split())
-
-        # Simple heuristic scoring
+        # Simple heuristic
+        ans = ua.lower()
         exchange.score_correctness = 70 if len(ans) > 20 else 40
         exchange.score_clarity = 60 if "." in ans else 35
-        exchange.score_confidence = 65 if "i" not in ans[:5] else 45
+        exchange.score_confidence = 65 if not ans.startswith("i ") else 45
 
         db.commit()
 
         return {"feedback": feedback}
 
     # ---------------------------------------------------------
-    # End session + Full scoring
+    # End session + score
     # ---------------------------------------------------------
     @staticmethod
     def end_session_and_score(session_id: int, db: Session):
@@ -120,9 +108,8 @@ class MockService:
             return None
 
         exchanges = session.exchanges or []
-        transcript_text = ""
+        transcript = ""
 
-        # Pick improved-answer candidates (short answers only)
         improve_candidates = []
         for ex in exchanges:
             ua = (ex.user_answer or "").strip()
@@ -133,57 +120,46 @@ class MockService:
 
         # Build transcript
         for ex in exchanges:
-            ua = ex.user_answer if ex.user_answer else "[no answer provided]"
-            transcript_text += f"Q: {ex.question_text}\nA: {ua}\n\n"
+            ua = ex.user_answer or "[no answer provided]"
+            transcript += f"Q: {ex.question_text}\nA: {ua}\n\n"
 
-        # Generate improved answers
+        # Improve answers
         for ex in improve_candidates:
             try:
-                prompt = (
-                    f"Question: {ex.question_text}\n"
-                    f"User Answer: {ex.user_answer}"
-                )
-                improved = LLMEngine.generate_response(
-                    prompt, task_type="improve_mock_answer"
-                )
-                ex.improved_answer = improved
-            except Exception as e:
-                logger.error(f"Improve-answer error for ex {ex.id}: {e}")
-                ex.improved_answer = None
+                prompt = f"Question: {ex.question_text}\nUser Answer: {ex.user_answer}"
+                raw = LLMEngine.generate_response(prompt, task_type="improve_mock_answer")
+                ex.improved_answer = raw.strip() if raw else SAFE_IMPROVED
+            except Exception:
+                ex.improved_answer = SAFE_IMPROVED
 
         db.commit()
 
-        if not transcript_text:
-            transcript_text = "No answers recorded."
+        if not transcript.strip():
+            transcript = "No answers recorded."
 
-        # ------------------------------
-        # CALL AI FOR FULL REPORT
-        # ------------------------------
-        prompt = (
-            f"Role: {session.target_role}\n\n"
-            f"Transcript:\n{transcript_text}"
-        )
+        # Final report
+        prompt = f"Role: {session.target_role}\n\nTranscript:\n{transcript}"
 
         raw_json = LLMEngine.generate_response(
             prompt, task_type="generate_interview_report"
         )
 
         if not raw_json:
-            logger.error("AI report empty or failed.")
             return {"status": "error", "message": "AI scoring failed"}
 
-        # Parse JSON safely
+        # Attempt to parse JSON
         try:
             start = raw_json.find("{")
             end = raw_json.rfind("}")
-            json_block = raw_json[start : end + 1]
-            data = json.loads(json_block)
+            if start == -1 or end == -1:
+                raise ValueError("Invalid JSON boundary")
+            data = json.loads(raw_json[start : end + 1])
         except Exception as e:
-            logger.error(f"Report JSON decode error: {e}")
+            logger.error(f"JSON decode error: {e}")
             return {"status": "error", "message": "Parsing failed"}
 
-        # Save scores
         scores = data.get("scores", {})
+
         session.overall_score = scores.get("overall", 50)
         session.technical_score = scores.get("technical", 50)
         session.communication_score = scores.get("communication", 50)
@@ -196,11 +172,7 @@ class MockService:
 
         db.commit()
 
-        return {
-            "status": "success",
-            "scores": scores,
-            "feedback": data.get("feedback", {}),
-        }
+        return {"status": "success", "scores": scores, "feedback": data.get("feedback", {})}
 
     # ---------------------------------------------------------
     # Get final results
@@ -215,24 +187,21 @@ class MockService:
         if not session or session.status != "completed":
             return None
 
-        feedback = (
-            json.loads(session.feedback_report)
-            if session.feedback_report
-            else {}
-        )
+        feedback = {}
+        if session.feedback_report:
+            try:
+                feedback = json.loads(session.feedback_report)
+            except:
+                feedback = {}
 
         transcript = []
         for ex in session.exchanges or []:
-            transcript.append(
-                {
-                    "question": ex.question_text,
-                    "user_answer": ex.user_answer
-                    if ex.user_answer
-                    else "[no answer provided]",
-                    "feedback": ex.ai_feedback,
-                    "improved_answer": ex.improved_answer,
-                }
-            )
+            transcript.append({
+                "question": ex.question_text,
+                "user_answer": ex.user_answer or "[no answer provided]",
+                "feedback": ex.ai_feedback,
+                "improved_answer": ex.improved_answer,
+            })
 
         return {
             "overall_score": session.overall_score,

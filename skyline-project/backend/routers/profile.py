@@ -31,7 +31,10 @@ router = APIRouter(prefix="/profile", tags=["Profile V2"])
 settings = get_settings()
 
 # --- Helper: Get or Create Dummy User (Since we don't have Auth yet) ---
-def get_current_user(db: Session):
+# NOTE: make this a proper FastAPI dependency so other routers can use:
+#   Depends(get_current_user)
+# It also remains callable directly with a DB session.
+def get_current_user(db: Session = Depends(get_db)):
     # For Phase 0, we use a single default user
     user = db.query(models.User).filter(models.User.email == "user@example.com").first()
     if not user:
