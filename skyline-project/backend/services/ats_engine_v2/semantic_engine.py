@@ -1,28 +1,9 @@
+# backend/services/ats_engine_v2/semantic_engine.py
 """
 Semantic Similarity Engine for ATS v2
 -------------------------------------
 
-Purpose:
-- Compute deep contextual similarity between resume and job description.
-- Uses sentence-transformer embeddings (MiniLM by default).
-- Produces normalized similarity score (0-100).
-- Generates semantic gap analysis:
-    - Which JD requirements are not reflected in resume?
-    - Which resume bullets strongly align?
-    - Which parts of the resume are contextually irrelevant?
-
-Outputs:
-{
-  "semantic_score": 82,
-  "high_matches": [...],
-  "weak_matches": [...],
-  "missing_requirements": [...],
-  "stats": {
-      "avg_similarity": 0.61,
-      "strong_alignment_count": 5,
-      "weak_alignment_count": 8
-  }
-}
+... (kept your original module docstring) ...
 """
 
 import re
@@ -49,7 +30,6 @@ def _split_into_sentences(text: str) -> List[str]:
     """
     Rough sentence splitting focused on resume bullet patterns.
     """
-    # split on newlines, bullets, punctuation
     parts = re.split(r'[\n•\-\*\.]+', text)
     sents = [p.strip() for p in parts if len(p.strip()) > 5]
     return sents[: ATS_CONFIG.get("semantic", {}).get("max_sentences", 120)]
@@ -72,7 +52,9 @@ def compute_semantic_similarity(resume_text: str, jd_text: str) -> Dict:
             "high_matches": [],
             "weak_matches": [],
             "missing_requirements": ["Semantic model unavailable"],
-            "stats": {}
+            "stats": {},
+            # helpful downstream: include an example_snippet as fallback
+            "example_snippet": None
         }
 
     # Split into sentence-level units
@@ -85,7 +67,8 @@ def compute_semantic_similarity(resume_text: str, jd_text: str) -> Dict:
             "high_matches": [],
             "weak_matches": [],
             "missing_requirements": [],
-            "stats": {"reason": "No sentences to compare"}
+            "stats": {"reason": "No sentences to compare"},
+            "example_snippet": resume_sents[0] if resume_sents else None
         }
 
     # Encode
@@ -128,7 +111,6 @@ def compute_semantic_similarity(resume_text: str, jd_text: str) -> Dict:
     avg_similarity = float(sim_matrix.mean())
 
     # Map similarity to score 0–100
-    # Linear mapping: 0.3 → 40, 0.6 → 75, 0.75 → 90, etc.
     def map_score(sim):
         if sim < 0.15: return 10
         if sim < 0.30: return 35
@@ -140,6 +122,16 @@ def compute_semantic_similarity(resume_text: str, jd_text: str) -> Dict:
 
     semantic_score = map_score(avg_similarity)
 
+    # Choose best example snippet for downstream "before" usage:
+    example_snippet = None
+    if high_matches:
+        example_snippet = high_matches[0].get("resume")
+    elif weak_matches:
+        example_snippet = weak_matches[0].get("resume")
+    else:
+        # If nothing matched, choose a short representative resume sentence if available
+        example_snippet = resume_sents[0] if resume_sents else None
+
     return {
         "semantic_score": semantic_score,
         "high_matches": high_matches[:10],  # limit for readability
@@ -149,5 +141,7 @@ def compute_semantic_similarity(resume_text: str, jd_text: str) -> Dict:
             "avg_similarity": round(avg_similarity, 3),
             "strong_alignment_count": len(high_matches),
             "weak_alignment_count": len(weak_matches)
-        }
+        },
+        # New key: an example resume sentence (useful for AI rewrite "before")
+        "example_snippet": example_snippet
     }
