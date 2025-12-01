@@ -1,9 +1,20 @@
 # backend/services/llm_engine.py
 """
-Deterministic rewrite for `rewrite_project`:
-- For task_type == "rewrite_project" we DO NOT call the LLM.
-- We synthesize a single past-tense action sentence from user input.
-- All other tasks still use Groq/Gemini fallback as before.
+LLM Engine wrapper (Groq primary, Gemini fallback) with deterministic rewrite support.
+
+Features:
+- Deterministic synthesis for task_type == "rewrite_project" (no external calls).
+- LLM-first helpers used by MockEngineV3:
+  - generate_initial_question(...)
+  - generate_next_question(...)
+  - evaluate_answer(...)
+  - improve_answer(...)
+  - generate_full_report(...)
+
+Notes:
+- call_llm and JSON parsing are resilient; functions return {} or "" on parse failure
+  so callers can fall back to deterministic logic.
+- Replace/extend `MODEL_NAME` and any model selection logic as needed.
 """
 
 import os
@@ -11,10 +22,13 @@ import re
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from dotenv import load_dotenv
-from openai import OpenAI
+
+# provider SDKs (optional)
+from openai import OpenAI  # used as Groq-compatible client in your code
 import google.generativeai as genai
+
 from backend.config import get_settings
 
 # Load .env
@@ -24,30 +38,34 @@ load_dotenv(dotenv_path=env_path)
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "llama-3.1-8b-instant"
+# Model selections
+MODEL_NAME = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GEMINI_MODEL = getattr(settings, "GEMINI_MODEL", "gemini-pro")
 
-# Initialize Groq client if available
+# Initialize Groq-like OpenAI client if API key present
 client: Optional[OpenAI] = None
 _groq_api_key = os.environ.get("GROQ_API_KEY") or getattr(settings, "GROQ_API_KEY", None)
 if _groq_api_key:
     try:
         client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=_groq_api_key)
-        print(f"✅ LLM Engine: Connected to Groq ({MODEL_NAME})")
+        logger.info("LLM Engine: Connected to Groq-compatible API.")
     except Exception as e:
-        logger.error(f"Groq Init Error: {e}", exc_info=True)
+        logger.exception("Groq/OpenAI client init failed: %s", e)
         client = None
 
-# Configure genai (non-fatal)
-if getattr(settings, "GEMINI_API_KEY", None):
+# Configure genai (Gemini) if key present
+_gemini_key = getattr(settings, "GEMINI_API_KEY", None)
+if _gemini_key:
     try:
-        genai.configure(api_key=getattr(settings, "GEMINI_API_KEY"))
+        genai.configure(api_key=_gemini_key)
+        logger.info("LLM Engine: Gemini (genai) configured.")
     except Exception:
-        logger.debug("genai configure failed or not available.", exc_info=True)
+        logger.exception("genai configure failed; continuing without it.")
 
 
 class LLMEngine:
     # ------------------------
-    # Utilities for deterministic synthesis
+    # Deterministic helpers (existing behavior preserved)
     # ------------------------
     @staticmethod
     def _enforce_word_limit(text: str, max_words: int = 35) -> str:
@@ -59,10 +77,7 @@ class LLMEngine:
     @staticmethod
     def _synthesize_from_input(user_input: str) -> str:
         """
-        Deterministic synthesis:
-        - Map common weak verbs to strong past-tense verbs (made->Developed, built->Built, fixed->Resolved).
-        - Remove leading pronouns.
-        - Construct: "<Verb> a/an <short noun phrase>." or "<Verb> <ACRONYM/...>."
+        Deterministic synthesis (used for task_type == 'rewrite_project').
         """
         if not user_input or not user_input.strip():
             return "Built project."
@@ -85,10 +100,8 @@ class LLMEngine:
             "automate": "Automated", "automated": "Automated",
         }
 
-        # Remove leading pronouns like "i", "we"
         lc = re.sub(r'^\s*(i am|i\'m|i|we|we\'re|we are)\s+', '', lc, flags=re.IGNORECASE).strip()
 
-        # Try to capture first verb and rest
         m = re.match(r'^(?P<v>[a-z]+)\s+(?P<rest>.+)$', lc)
         verb_word = None
         rest = lc
@@ -108,16 +121,13 @@ class LLMEngine:
         if not chosen_verb:
             chosen_verb = "Built"
 
-        # Clean rest: remove leading articles
         rest = re.sub(r'^\s*(a|an|the)\s+', '', rest, flags=re.IGNORECASE).strip()
         rest_words = rest.split()
         if len(rest_words) > 12:
             rest = " ".join(rest_words[:12])
 
-        # Capitalize rest appropriately
         if rest:
             rest = rest[0].upper() + rest[1:] if rest[0].isalpha() else rest
-            # Choose article heuristics
             if re.match(r'^[AEIOUaeiou]', rest):
                 sentence = f"{chosen_verb} an {rest}."
             else:
@@ -132,11 +142,82 @@ class LLMEngine:
         if not re.search(r'[\.!?]$', sentence):
             sentence = sentence.rstrip('.') + '.'
 
-        # Enforce word limit (default 35 words)
         sentence = LLMEngine._enforce_word_limit(sentence, max_words=35)
         if not re.search(r'[\.!?]$', sentence):
             sentence = sentence.rstrip('.') + '.'
         return sentence
+
+    # ------------------------
+    # Low-level LLM call (Groq -> Gemini)
+    # Returns raw text output (string). Does not parse JSON.
+    # ------------------------
+    @staticmethod
+    def _call_llm(messages: list, max_tokens: int = 512, temperature: float = 0.1) -> str:
+        raw_text = ""
+        # Try Groq/OpenAI-compatible client first
+        if client:
+            try:
+                resp = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                raw_text = getattr(resp.choices[0].message, "content", "") or ""
+                logger.debug("Groq response length=%d", len(raw_text or ""))
+            except Exception as e:
+                logger.exception("Groq call failed: %s", e)
+                raw_text = ""
+
+        # Fallback to Gemini (genai)
+        if not raw_text and _gemini_key:
+            try:
+                # Use a simple concatenated prompt for genai
+                full_prompt = "\n".join([m["content"] for m in messages if m.get("role") in ("system", "user")])
+                model = genai.GenerativeModel(GEMINI_MODEL)
+                resp = model.generate_content(full_prompt)
+                raw_text = getattr(resp, "text", "") or str(resp)
+                logger.debug("Gemini response length=%d", len(raw_text or ""))
+            except Exception as e:
+                logger.exception("genai call failed: %s", e)
+                raw_text = ""
+
+        # Final safety: remove code fences and tidy whitespace
+        if raw_text:
+            cleaned = re.sub(r"```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+            cleaned = cleaned.replace("`", "").replace("**", "").strip()
+            cleaned = re.sub(r"\r\n", "\n", cleaned)
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+            return cleaned.strip()
+
+        return ""
+
+    # ------------------------
+    # JSON helper: attempt to parse JSON from model text robustly
+    # ------------------------
+    @staticmethod
+    def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        # Try direct parse
+        try:
+            return json.loads(text)
+        except Exception:
+            # Extract the first {...} block
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start:end+1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    # attempt to fix common issues: single quotes -> double
+                    cand2 = candidate.replace("'", '"')
+                    try:
+                        return json.loads(cand2)
+                    except Exception:
+                        return None
+            return None
 
     # ------------------------
     # Public API
@@ -144,197 +225,199 @@ class LLMEngine:
     @staticmethod
     def generate_response(prompt: str, task_type: str = "chat", role: str = "General") -> str:
         """
-        If task_type == 'rewrite_project' -> deterministic synthesis (no LLM calls).
-        Otherwise -> call LLM (Groq preferred) and return cleaned text.
+        General-purpose text response. If task_type == 'rewrite_project' use deterministic synthesis.
+        Otherwise call LLM and return cleaned text.
         """
-        gemini_key = getattr(settings, "GEMINI_API_KEY", None)
-
-        # If neither client present and task isn't rewrite_project, return demo
-        if task_type != "rewrite_project" and not client and not gemini_key:
-            return "Demo Mode: AI suggestions unavailable without key."
-
-        # Deterministic short rewrite (guaranteed)
         if task_type == "rewrite_project":
             return LLMEngine._synthesize_from_input(prompt)
 
-        # For other tasks, fallback to LLM call
-        try:
-            if task_type == "refine_bio":
-                system_msg = "You are a Resume Editor. Reformat the bio to be professional , grammatical correct and confident. RULES: Max 40 words. NO markdown."
-            elif task_type == "improve_experience":
-                system_msg = "You are a Career Coach. Rewrite the input into a single powerful bullet point. RULES: Start with a strong Action Verb. Quantify results where possible. NO lists."
-            elif task_type == "mock_interview":
-                system_msg = f"You are a strict interviewer for a {role} role. Ask short, relevant questions."
-            elif task_type == "resume":
-                system_msg = "You are an expert Resume Writer. Output valid JSON only."
-            elif task_type == "reformat_description":
-                system_msg = (
-                    "You are a professional technical writer. Reformat the USER'S DESCRIPTION into a single clean formatted paragraph. "
-                    "Output ONLY the paragraph, nothing else especially no key points."
-                )
-            else:
-                system_msg = f"You are a helpful assistant. Role: {role}."
+        # Build system/user messages based on task_type
+        if task_type == "mock_interview":
+            system_msg = f"You are a concise interviewer for role: {role}."
+        elif task_type == "improve_experience":
+            system_msg = "You are a Career Coach. Rewrite the input into a single powerful bullet point. Use an action verb; quantify when possible."
+        elif task_type == "refine_bio":
+            system_msg = "You are a Resume Editor. Reformat the bio to be professional and confident. Max 40 words. No markdown."
+        else:
+            system_msg = f"You are a helpful assistant. Role: {role}."
 
-            messages = [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": f"Input: {prompt}\nOutput:"}
-            ]
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Input: {prompt}\n\nOutput:"}
+        ]
 
-            raw_text = ""
-
-            # Try Groq
-            if client:
-                try:
-                    resp = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=messages,
-                        temperature=0.1,
-                        max_tokens=300
-                    )
-                    raw_text = resp.choices[0].message.content or ""
-                except Exception as e:
-                    logger.error(f"Groq generate_response error: {e}", exc_info=True)
-                    raw_text = ""
-
-            # Fallback to genai (best-effort)
-            if not raw_text and gemini_key:
-                try:
-                    model = genai.GenerativeModel("gemini-pro")
-                    full_prompt = f"{system_msg}\n\nInput: {prompt}\nOutput:"
-                    resp = model.generate_content(full_prompt)
-                    raw_text = getattr(resp, "text", "") or str(resp)
-                except Exception as e:
-                    logger.error(f"genai generate_response error: {e}", exc_info=True)
-                    raw_text = ""
-
-            # Simple cleaning for UI
-            if raw_text:
-                # remove code fences and markdown, trim
-                cleaned = re.sub(r"```.*?```", "", raw_text, flags=re.DOTALL)
-                cleaned = cleaned.replace("`", "").replace("**", "").replace("*", "").strip()
-                cleaned = re.sub(r"\r\n", "\n", cleaned)
-                cleaned = re.sub(r"\n{2,}", "\n\n", cleaned)
-                return cleaned.strip()
-
+        raw = LLMEngine._call_llm(messages, max_tokens=600, temperature=0.15)
+        if not raw:
             return "AI Service did not return a response."
+        return raw.strip()
 
-        except Exception as e:
-            logger.error(f"LLM Error in generate_response: {e}", exc_info=True)
-            return "AI Service Error."
-
-    @staticmethod
-    def generate_resume(profile_data: dict, job_description: str, style: str = "modern") -> Dict:
+    # ------------------------
+    # Higher-level helpers (return dicts or empty dict on parse failure)
+    # ------------------------
+    def generate_initial_question(self, role: str, difficulty: str = "Medium", personality: str = "") -> Dict[str, Any]:
         """
-        Resume generation (unchanged): Groq first, Gemini/OpenAI fallback, genai last.
+        Ask LLM to provide a single JSON: { "question": "..." }
         """
-        gemini_key = getattr(settings, "GEMINI_API_KEY", None)
-        groq_env_key = os.environ.get("GROQ_API_KEY") or getattr(settings, "GROQ_API_KEY", None)
+        system_msg = f"You are an interviewer. {personality} Produce one clear interview question for role '{role}' at difficulty '{difficulty}'. Return JSON: {{ 'question': '...' }}"
 
-        if not gemini_key and not groq_env_key:
-            return LLMEngine._get_mock_resume()
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": "Return JSON only."}
+        ]
 
+        raw = self._call_llm(messages, max_tokens=160, temperature=0.2)
+        parsed = self._safe_parse_json(raw)
+        if parsed and "question" in parsed:
+            return parsed
+        # also accept simple string (plain question)
+        if raw:
+            return {"question": raw.strip()}
+        return {}
+
+    def generate_next_question(self, role: str, difficulty: str, last_answer: Optional[str], personality: str = "") -> Dict[str, Any]:
+        """
+        Generate follow-up or next question. Return JSON { "question": "..." } or {}.
+        """
+        system_msg = f"You are an interviewer. {personality} Given role '{role}' and difficulty '{difficulty}', provide the next question. If last_answer exists, adapt the question as a follow-up. Return JSON: {{ 'question': '...' }}."
+        user_content = f"last_answer: {json.dumps(last_answer)}" if last_answer else "No last answer provided."
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_content}
+        ]
+        raw = self._call_llm(messages, max_tokens=200, temperature=0.25)
+        parsed = self._safe_parse_json(raw)
+        if parsed and "question" in parsed:
+            return parsed
+        if raw:
+            return {"question": raw.strip()}
+        return {}
+
+    def evaluate_answer(self, answer: str, question: str, role: str, personality: str = "", resume_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Ask the LLM to evaluate the answer. Expect JSON with keys:
+          score (0-100), feedback (str), strengths (list), weaknesses (list)
+        Returns parsed dict or {} if model didn't return parseable JSON.
+        """
+        system_msg = f"You are an interviewer & evaluator. {personality} Evaluate candidate's answer for role '{role}'. Prefer concise factual scoring."
+        user_prompt = (
+            f"Question: {question}\n"
+            f"Answer: {answer}\n\n"
+            "Return JSON: {\"score\": 0-100, \"feedback\":\"...\", \"strengths\": [..], \"weaknesses\": [..]}."
+        )
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt}
+        ]
+        raw = self._call_llm(messages, max_tokens=300, temperature=0.15)
+        parsed = self._safe_parse_json(raw)
+        if parsed and "score" in parsed:
+            # coerce numeric types
+            try:
+                parsed["score"] = int(parsed["score"])
+            except Exception:
+                pass
+            return parsed
+        # As a helpful fallback, attempt to extract a simple numeric score in text
+        if raw:
+            # e.g., "Score: 72/100 — feedback..."
+            m = re.search(r"score[:\s]+(\d{1,3})", raw, re.IGNORECASE)
+            if m:
+                try:
+                    score = int(m.group(1))
+                    return {"score": score, "feedback": raw.strip(), "strengths": [], "weaknesses": []}
+                except Exception:
+                    pass
+        return {}
+
+    def improve_answer(self, answer: str, question: str, role: str, personality: str = "") -> Dict[str, Any]:
+        """
+        Request an improved/rewrite of the user's answer.
+        Returns { "improved_answer": "..." } or {}.
+        """
+        system_msg = f"You are an interviewer and writing coach. {personality} Rewrite the answer to be concise, impactful, and quantifying where reasonable. Return JSON: {{'improved_answer': '...'}}"
+        user_prompt = f"Question: {question}\nInput Answer: {answer}\nReturn JSON only."
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt}
+        ]
+        raw = self._call_llm(messages, max_tokens=300, temperature=0.2)
+        parsed = self._safe_parse_json(raw)
+        if parsed and ("improved_answer" in parsed or "rewrite" in parsed or "rewrite_text" in parsed):
+            # normalize key
+            if "improved_answer" not in parsed:
+                for k in ("rewrite", "rewrite_text", "improved"):
+                    if k in parsed:
+                        parsed = {"improved_answer": parsed[k], **{x: parsed[x] for x in parsed if x not in (k,)}}
+                        break
+            return parsed
+        if raw:
+            return {"improved_answer": raw.strip()}
+        return {}
+
+    def generate_full_report(self, session: Dict, personality: str = "") -> Dict[str, Any]:
+        """
+        Ask the model to synthesize a full report for the entire session.
+        Expect JSON with keys:
+          overall_score, dimensions {communication, technical_depth, structure, confidence},
+          strengths, weaknesses, quick_wins (list of {title,description}), transcript (list)
+        Returns parsed dict or {}.
+        """
+        system_msg = f"You are an interviewer and analyst. {personality} Produce a JSON report summarizing the session with overall_score (0-100), dimensions, strengths, weaknesses, quick_wins, transcript."
+        # Truncate session for prompt safety
+        try:
+            short_session = json.dumps(session, default=str)[:4000]
+        except Exception:
+            short_session = "{}"
+        user_prompt = f"Session: {short_session}\nReturn JSON only."
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt}
+        ]
+        raw = self._call_llm(messages, max_tokens=1200, temperature=0.15)
+        parsed = self._safe_parse_json(raw)
+        if parsed and "overall_score" in parsed:
+            return parsed
+        # fallback: if text contains something useful, return text in 'notes' to let caller fallback
+        if raw:
+            return {"notes": "LLM returned unparsable report; see raw_text", "raw_text": raw}
+        return {}
+
+    # Keep existing resume generator entrypoint from earlier file (optional)
+    def generate_resume(self, profile_data: dict, job_description: str, style: str = "modern") -> Dict[str, Any]:
+        """
+        High-level resume generation. Attempts Groq -> Gemini.
+        If unavailable, returns a small mock JSON.
+        """
         system_msg = (
             "You are an expert Resume Writer. Output strictly valid JSON. "
             "Do NOT include markdown formatting or code fences."
         )
-
         prompt = f"""
 REQUIRED STYLE: {style.upper()}
-- If 'MODERN': Concise, metric-heavy, active voice.
-- If 'PROFESSIONAL': Formal, traditional structure.
-- If 'CREATIVE': Engaging vocabulary, highlight personality.
-- If 'ACADEMIC': Focus on research and detailed qualifications.
-
-Task 1: Write a professional resume tailored to the JD.
-Task 2: Provide 3 actionable tips.
-
 USER PROFILE:
 {json.dumps(profile_data)}
-
 JOB DESCRIPTION:
 {job_description}
-
 OUTPUT SCHEMA (JSON ONLY):
-{{
-  "resume_markdown": "# Name...",
-  "suggestions": ["Tip 1", "Tip 2", "Tip 3"]
-}}
+{{ "resume_markdown": "...", "suggestions": ["..."] }}
 """
-
-        raw_text = ""
-
-        if client:
-            try:
-                response = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=2000,
-                )
-                raw_text = response.choices[0].message.content or ""
-            except Exception as e:
-                logger.error(f"Groq error in generate_resume: {e}", exc_info=True)
-                raw_text = ""
-
-        if not raw_text and gemini_key:
-            try:
-                gemini_model = getattr(settings, "GEMINI_MODEL", "gpt-4o-mini")
-                temp_client = OpenAI(api_key=gemini_key)
-                response = temp_client.chat.completions.create(
-                    model=gemini_model,
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=2000,
-                )
-                raw_text = response.choices[0].message.content or ""
-            except Exception as e:
-                logger.error(f"Gemini/OpenAI fallback error in generate_resume: {e}", exc_info=True)
-                raw_text = ""
-
-        if not raw_text and getattr(settings, "GEMINI_API_KEY", None):
-            try:
-                full_prompt = f"{system_msg}\n\n{prompt}"
-                model = genai.GenerativeModel("gemini-pro")
-                genai_resp = model.generate_content(full_prompt)
-                raw_text = getattr(genai_resp, "text", None) or str(genai_resp)
-            except Exception:
-                logger.debug("genai fallback for resume failed or incompatible.", exc_info=True)
-
-        if not raw_text:
-            logger.error("No raw_text returned by any model in generate_resume; returning mock.")
-            return LLMEngine._get_mock_resume()
-
-        # Try parse JSON or extract {...} block
-        clean_text = re.sub(r"```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE).strip()
-        try:
-            parsed = json.loads(clean_text)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            start = clean_text.find("{")
-            end = clean_text.rfind("}")
+        messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}]
+        raw = self._call_llm(messages, max_tokens=1600, temperature=0.25)
+        parsed = self._safe_parse_json(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        # try to extract {...}
+        if raw:
+            start = raw.find("{")
+            end = raw.rfind("}")
             if start != -1 and end != -1 and end > start:
                 try:
-                    candidate = clean_text[start:end+1]
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, dict):
-                        return parsed
-                except json.JSONDecodeError:
-                    logger.error("JSON parsing failed on extracted {...} block in generate_resume.", exc_info=True)
-
-        logger.error("Failed to parse JSON from model output in generate_resume.")
-        logger.debug(f"Model raw output (truncated): {clean_text[:4000]}")
-        return LLMEngine._get_mock_resume()
-
-    @staticmethod
-    def _get_mock_resume() -> Dict:
+                    return json.loads(raw[start:end+1])
+                except Exception:
+                    pass
+        # final mock fallback
         return {
             "resume_markdown": "# Mock Resume\n\nAI Service Unavailable.",
-            "suggestions": ["Check API Keys (GROQ_API_KEY, GEMINI_API_KEY)", "Restart your backend after setting keys"]
+            "suggestions": ["Check API Keys (GROQ_API_KEY, GEMINI_API_KEY)", "Restart backend after setting keys"]
         }

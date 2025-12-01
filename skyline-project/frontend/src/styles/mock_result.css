@@ -1,0 +1,105 @@
+/* mock_result.css
+   Supplementary styles for MockResult.jsx (non-Tailwind fallbacks / animations).
+   Intended to be imported once in the app (e.g. src/styles/mock_result.css)
+
+   How to use:
+   1. Save this file to src/styles/mock_result.css
+   2. Import it in your MockResult.jsx (or App.jsx):
+        import '../styles/mock_result.css';
+
+   Notes:
+   - These classes are prefixed with `mr-` to avoid collisions with existing styles.
+   - The component still uses Tailwind for layout — this file provides
+     animations, the confetti overlay, and a few utility helpers.
+*/
+
+:root{
+  --mr-indigo: #6366f1;
+  --mr-indigo-600: #4f46e5;
+  --mr-green: #10b981;
+  --mr-red: #ef4444;
+  --mr-muted: #6b7280;
+}
+
+/* ---------- Gauge tweaks (SVG friendly) ---------- */
+.mr-gauge-svg { display:block; margin:0 auto; }
+.mr-gauge-circle-bg { stroke: #e5e7eb; }
+.mr-gauge-circle { stroke-linecap: round; transform-origin: 50% 50%; }
+.mr-gauge-animate { transition: stroke-dashoffset 1.2s cubic-bezier(.22,.9,.3,1); }
+
+/* small numeric counter pop */
+.mr-score-badge { font-weight: 700; color: var(--mr-indigo-600); }
+.mr-score-badge--celebrate { color: var(--mr-green); }
+
+/* ---------- Confetti (lightweight CSS confetti) ---------- */
+.mr-confetti-wrap { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+.mr-confetti-piece {
+  position: absolute;
+  width: 8px; height: 14px;
+  opacity: 0; transform-origin: center;
+  will-change: transform, opacity;
+}
+
+/* pre-generated keyframes used by individual pieces */
+@keyframes mr-confetti-fall {
+  0% { transform: translateY(-10vh) rotate(0deg) scale(1); opacity: 1; }
+  60% { opacity: 1; }
+  100% { transform: translateY(120vh) rotate(360deg) scale(0.9); opacity: 0; }
+}
+
+/* utility: spawn N pieces by inline style -- see MockResult (JS will set left/top/delay/duration) */
+.mr-confetti-piece.show { opacity: 1; animation-name: mr-confetti-fall; animation-timing-function: cubic-bezier(.2,.85,.25,1); }
+
+/* ---------- Pulse / micro celebration for high score ---------- */
+.mr-celebrate {
+  position: relative;
+}
+
+.mr-pulse {
+  display:inline-block;
+  position: absolute;
+  left:50%; top:50%; transform:translate(-50%,-50%);
+  width: 220px; height: 220px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(99,102,241,0.12) 0%, rgba(99,102,241,0.04) 40%, transparent 60%);
+  opacity: 0; pointer-events:none;
+  animation: mr-pulse-scale 1.2s ease-out forwards;
+}
+@keyframes mr-pulse-scale {
+  0% { transform: translate(-50%,-50%) scale(0.6); opacity: 1; }
+  60% { transform: translate(-50%,-50%) scale(1); opacity: 0.65; }
+  100% { transform: translate(-50%,-50%) scale(1.18); opacity: 0; }
+}
+
+/* ---------- Cards & small utilities ---------- */
+.mr-card { border-radius: 14px; box-shadow: 0 8px 24px rgba(15,23,42,0.06); background: #fff; }
+.mr-card--muted { background: linear-gradient(180deg,#fff,#fbfdff); }
+
+.mr-kw-chip {
+  display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
+  background:#fff; border:1px solid rgba(15,23,42,0.04); font-size:13px; color:#374151;
+}
+
+/* copy button */
+.mr-copy-btn { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:8px; border:1px solid rgba(15,23,42,0.06); background:#fff; cursor:pointer; }
+.mr-copy-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(99,102,241,0.08); }
+
+/* transcript blocks */
+.mr-transcript-row { padding:18px; }
+.mr-transcript-q { color: #111827; font-weight:600; margin-bottom:8px; }
+.mr-transcript-user { background: #fff7ed; border:1px solid rgba(250,204,21,0.12); color:#92400e; padding:12px; border-radius:10px; }
+.mr-transcript-suggest { background: #ecfdf5; border:1px solid rgba(16,185,129,0.12); color:#065f46; padding:12px; border-radius:10px; }
+
+/* responsive tweaks */
+@media (max-width: 768px) {
+  .mr-confetti-wrap { display:none; }
+  .mr-pulse { width:160px; height:160px; }
+}
+
+/* small accessibility focus ring */
+.mr-focusable:focus { outline: 3px solid rgba(99,102,241,0.14); outline-offset: 4px; }
+
+/* subtle entrance */
+.mr-fade-in { animation: mr-fade-in 420ms cubic-bezier(.22,.9,.3,1) both; }
+@keyframes mr-fade-in { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform:none; } }
+
+/* end of mock_result.css */
