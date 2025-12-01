@@ -1,433 +1,413 @@
 # backend/routers/mock_v2.py
-"""
-Lightweight Mock Interview router (drop-in replacement).
-Provides:
- - /mock/start            (legacy simple start)
- - /mock/question         (legacy fetch question)
- - /mock/answer           (legacy submit answer)
- - /mock/end              (legacy finish)
- - /mock-v2/start-session
- - /mock-v2/{session_id}/next
- - /mock-v2/submit-answer
- - /mock-v2/{session_id}/end
- - /mock-v2/{session_id}/results
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field, ValidationError
+from typing import Optional, Dict, Any, List, Union
+from uuid import uuid4
+import logging
+import threading
+import traceback
 
-This file embeds:
- - a tiny question bank
- - an in-router deterministic evaluator (safe, fast, no external deps)
- - an in-memory session store (for dev). Persist externally in production.
-"""
+from sqlalchemy.orm import Session
 
-from fastapi import APIRouter, Body, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import uuid
-import random
-import time
-import re
+from backend.database import get_db
+from backend.models.mock_models import MockSession, MockInteraction
 
-router = APIRouter(prefix="/mock-v2", tags=["Mock Interview V2"])
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/mock-v2", tags=["Mock V2"])
 
-# --- Simple in-memory session store (dev only) ---
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+# ---- Try to import llm evaluator (LLM-first). If not available, we'll fallback to deterministic mock_engine ----
+try:
+    from backend.services.mock.llm_evaluator import ask_question as llm_ask_question, evaluate_answer as llm_evaluate_answer
+    LLM_AVAILABLE = True
+except Exception:
+    LLM_AVAILABLE = False
+    llm_ask_question = None
+    llm_evaluate_answer = None
 
-# --- Basic question bank (expand as needed) ---
-QUESTION_BANK = {
-    "frontend": [
-        "Explain the difference between CSS Grid and Flexbox and when you'd use each.",
-        "How does the browser render a web page from HTML/CSS/JS?",
-        "What is event delegation and why is it useful?",
-        "Describe React component lifecycle and hooks replacement for lifecycle methods.",
-        "How would you improve performance of a slow React application?"
-    ],
-    "backend": [
-        "Explain ACID vs BASE properties of databases.",
-        "What is a memory leak in a server app and how would you troubleshoot it?",
-        "Describe how HTTP/2 improves over HTTP/1.1.",
-        "How would you design an API rate limiter?",
-        "Explain transactions and isolation levels in relational DBs."
-    ],
-    "general": [
-        "Tell me about a time you faced a technical challenge and how you solved it.",
-        "How do you prioritize tasks when given multiple deadlines?",
-        "Explain the STAR method for behavioral answers.",
-        "Describe a project you led and the outcome.",
-        "How do you keep up-to-date with technical trends?"
-    ]
-}
+try:
+    # deterministic fallback (existing rule-based evaluator)
+    from backend.services.mock_engine import evaluate_answer as deterministic_evaluate_answer
+    from backend.services.mock.question_bank import get_random_question as deterministic_get_question
+    FALLBACK_AVAILABLE = True
+except Exception:
+    FALLBACK_AVAILABLE = False
+    deterministic_evaluate_answer = None
+    deterministic_get_question = None
 
-# small pool of action verbs for evaluation heuristics
-ACTION_VERBS = {"led","developed","implemented","created","designed","improved","optimized","built","reduced","increased","launched","resolved","managed","coached","mentored"}
-
-HEDGING_WORDS = {"maybe","might","possibly","sometimes","could","probably","try","attempt","ish","sort of","kind of","might've","maybe"}
+# Simple in-memory store for session metadata (question_count, asked_count).
+_sessions_meta_lock = threading.Lock()
+_sessions_meta: Dict[str, Dict[str, Optional[int]]] = {}
+# structure: { session_id: {"total": Optional[int], "asked": int} }
 
 
-# ---------- Request models ----------
-class StartReq(BaseModel):
-    role: Optional[str] = "general"
+# ----- Request/Response models -----
+class StartSessionReq(BaseModel):
+    target_role: Optional[str] = "general"
     difficulty: Optional[str] = "Medium"
-    question_count: Optional[int] = 5
-    resume_id: Optional[Any] = None
+    question_count: Optional[int] = None
+    resume_id: Optional[int] = None
 
 
-class SessionReq(BaseModel):
-    session_id: str
-
-
-class AnswerReq(BaseModel):
+# Accept exchange_id as either str or int; we'll coerce to str internally to avoid 422
+class SubmitAnswerReq(BaseModel):
     session_id: str
     answer: str
-    exchange_id: Optional[str] = None
+    exchange_id: Optional[Union[str, int]] = Field(default=None)
 
 
-# ---------- Utilities ----------
-def _new_session(role: str = "general", question_count: int = 5, difficulty: str = "Medium", resume_id: Optional[Any] = None) -> Dict[str, Any]:
-    sid = str(uuid.uuid4())
-    role_key = role.lower() if role and role.lower() in QUESTION_BANK else "general"
-    # pick a shuffled list of questions for session
-    qlist = QUESTION_BANK.get(role_key, QUESTION_BANK["general"]).copy()
-    random.shuffle(qlist)
-    # ensure enough questions (repeat if necessary)
-    while len(qlist) < question_count:
-        qlist.extend(random.sample(QUESTION_BANK.get(role_key, QUESTION_BANK["general"]), k=len(QUESTION_BANK.get(role_key, QUESTION_BANK["general"]))))
-    qlist = qlist[:question_count]
-
-    questions = []
-    for i, q in enumerate(qlist, start=1):
-        questions.append({
-            "question_id": str(uuid.uuid4()),
-            "question_text": q,
-            "current_index": i,
-            "total_questions": question_count
-        })
-
-    sess = {
-        "session_id": sid,
-        "role": role_key,
-        "difficulty": difficulty,
-        "questions": questions,
-        "pointer": 0,  # next question index
-        "history": [],  # list of {question_id, question, answer, eval}
-        "started_at": time.time(),
-        "finished": False,
-        "resume_id": resume_id,
-        "report": None
-    }
-    SESSIONS[sid] = sess
-    return sess
+# ----- Helpers -----
+def _get_session(db: Session, session_id: str) -> Optional[MockSession]:
+    return db.query(MockSession).filter(MockSession.session_id == session_id).first()
 
 
-def _get_session(sid: str) -> Dict[str, Any]:
-    s = SESSIONS.get(sid)
-    if not s:
-        raise HTTPException(status_code=404, detail="session not found")
-    return s
+def _create_interaction(db: Session, session: MockSession, question_text: Optional[str], answer_text: Optional[str] = None) -> MockInteraction:
+    inter = MockInteraction(session_id_fk=session.id, question=question_text, answer=answer_text, feedback=None)
+    db.add(inter)
+    db.commit()
+    db.refresh(inter)
+    return inter
 
 
-# Deterministic / heuristic evaluator (safe fallback)
-def deterministic_evaluate_answer(question_text: str, answer_text: str) -> Dict[str, Any]:
+def _record_session_meta(session_id: str, total: Optional[int]):
+    with _sessions_meta_lock:
+        _sessions_meta[session_id] = {"total": total, "asked": 0}
+
+
+def _inc_asked(session_id: str):
+    with _sessions_meta_lock:
+        meta = _sessions_meta.get(session_id)
+        if not meta:
+            _sessions_meta[session_id] = {"total": None, "asked": 1}
+            return 1
+        meta["asked"] = (meta.get("asked") or 0) + 1
+        return meta["asked"]
+
+
+def _get_meta(session_id: str) -> Dict[str, Optional[int]]:
+    with _sessions_meta_lock:
+        return _sessions_meta.get(session_id, {"total": None, "asked": 0})
+
+
+def _should_finish(session_id: str) -> bool:
+    meta = _get_meta(session_id)
+    total = meta.get("total")
+    asked = meta.get("asked", 0)
+    if total is None:
+        return False
+    return asked >= total
+
+
+def _ask_question_llm_or_fallback(role: str, difficulty: Optional[str]) -> Dict[str, Any]:
     """
-    Lightweight scoring heuristics:
-    - word_count -> boosts length up to sweet spot
-    - action_verbs -> counts presence of action verbs
-    - numeric_mentions -> counts numbers (evidence/metrics)
-    - leadership_mentions -> simple leadership token hits
-    - hedging_count -> penalize hedging words
-    Returns a dict with score 0-100, strengths, weaknesses, metrics.
+    Return dict with keys: text (question text), provider (string)
     """
-    text = (answer_text or "").strip()
-    words = re.findall(r"\w+|[0-9]+", text)
-    word_count = len(words)
-    # action verbs count (case-insensitive)
-    actions = sum(1 for w in words if w.lower() in ACTION_VERBS)
-    # numbers (simple digits)
-    numeric_mentions = len(re.findall(r"\d+", answer_text))
-    # leadership mentions
-    leadership = sum(1 for w in words if w.lower() in {"lead","led","manage","managed","mentor","mentored","coached"})
-    # hedging
-    hedges = sum(1 for w in re.findall(r"\w+\'?\w*|\S", answer_text.lower()) if any(h in w for h in HEDGING_WORDS))
+    # Try LLM first if available
+    if LLM_AVAILABLE:
+        try:
+            res = llm_ask_question(role=role, difficulty=difficulty)
+            if isinstance(res, dict) and res.get("text"):
+                return {"text": res.get("text"), "provider": res.get("provider", "llm")}
+        except Exception:
+            logger.exception("LLM ask_question failed")
 
-    # length score: prefer moderate answers ~20-120 words
-    if word_count == 0:
-        length_score = 0
-    elif word_count < 10:
-        length_score = 15
-    elif word_count <= 30:
-        length_score = 40
-    elif word_count <= 120:
-        length_score = 70
-    else:
-        length_score = 55
+    # Fallback deterministic question bank
+    try:
+        if FALLBACK_AVAILABLE:
+            q = deterministic_get_question(role=role, difficulty=difficulty)
+            # deterministic_get_question might return either text or dict
+            if isinstance(q, dict):
+                return {"text": q.get("question") or q.get("text") or "Tell me about yourself.", "provider": "fallback"}
+            return {"text": q or "Tell me about yourself.", "provider": "fallback"}
+    except Exception:
+        logger.exception("fallback question bank failed")
 
-    # action score
-    action_score = min(20, actions * 8)  # up to 20
-
-    # quantified score
-    quantified_score = min(20, numeric_mentions * 8)
-
-    # leadership score
-    leadership_score = min(15, leadership * 8)
-
-    # hedging penalty
-    hedging_penalty = min(20, hedges * 6)
-
-    raw = {
-        "length_score": length_score,
-        "action_score": action_score,
-        "quantified_score": quantified_score,
-        "leadership_score": leadership_score,
-        "hedging_penalty": hedging_penalty
-    }
-
-    # simple weighted final score
-    # weights chosen to prefer clarity + actions + some quant
-    score = (
-        0.35 * length_score +
-        0.30 * action_score +
-        0.20 * quantified_score +
-        0.15 * leadership_score
-    ) - hedging_penalty
-
-    score = max(0, min(100, int(round(score))))
-
-    # strengths / weaknesses text
-    strengths = []
-    weaknesses = []
-    if actions:
-        strengths.append(f"Uses action verbs ({actions}).")
-    if leadership:
-        strengths.append("Shows leadership/ownership.")
-    if numeric_mentions:
-        strengths.append(f"Provides quantified evidence ({numeric_mentions}).")
-    if word_count >= 10 and word_count <= 120:
-        strengths.append("Answer length is appropriate.")
-
-    if word_count == 0:
-        weaknesses.append("No answer provided.")
-    elif word_count < 10:
-        weaknesses.append("Answer is short; add more detail and examples.")
-    if hedging_penalty:
-        weaknesses.append("Hedging language detected; be more assertive.")
-    if numeric_mentions == 0:
-        weaknesses.append("No quantified evidence provided; add numbers where possible.")
-
-    feedback = f"Score: {score}/100 — length:{word_count}, action:{action_score}, leadership:{leadership_score}, quantified:{quantified_score}, hedging_penalty:{hedging_penalty}. Strengths: {'; '.join(strengths) if strengths else 'None.'} Weaknesses: {'; '.join(weaknesses) if weaknesses else 'None.'}"
-
-    metrics = {
-        "word_count": word_count,
-        "action_verbs": actions,
-        "leadership_mentions": leadership,
-        "numeric_mentions": numeric_mentions,
-        "hedging_count": hedges,
-        "raw_components": raw
-    }
-
-    return {
-        "score": score,
-        "strengths": strengths,
-        "weaknesses": weaknesses,
-        "feedback": feedback,
-        "metrics": metrics
-    }
+    # Ultimate safe default
+    return {"text": "Tell me about yourself.", "provider": "fallback"}
 
 
-# ---------- Legacy-style endpoints (minimal) ----------
-legacy_router = APIRouter(prefix="/mock", tags=["Mock Interview - legacy"])
+def _evaluate_answer_llm_or_fallback(answer: str, role: str) -> Dict[str, Any]:
+    """
+    Return dict with keys:
+      ok: bool
+      evaluation: dict (score, feedback, metrics...)
+      provider: str
+    """
+    if LLM_AVAILABLE:
+        try:
+            res = llm_evaluate_answer(answer=answer, role=role)
+            # Expect a dict like {"ok": True, "evaluation": {...}, "provider": "llm"}
+            if isinstance(res, dict) and res.get("ok", False):
+                return {"ok": True, "evaluation": res.get("evaluation", {}), "provider": res.get("provider", "llm")}
+        except Exception:
+            logger.exception("LLM evaluate_answer failed")
 
-@legacy_router.post("/start")
-def legacy_start(payload: StartReq):
-    sess = _new_session(role=payload.role or "general", question_count=payload.question_count or 5, difficulty=payload.difficulty or "Medium", resume_id=payload.resume_id)
-    first_q = sess["questions"][0]
-    return {"status": "success", "data": {"session_id": sess["session_id"], "question": first_q["question_text"], "role": sess["role"]}}
+    # Fallback deterministic evaluator
+    if FALLBACK_AVAILABLE:
+        try:
+            ev = deterministic_evaluate_answer(answer, role)
+            # deterministic_evaluate_answer expected to return a dict-like evaluation
+            return {"ok": True, "evaluation": ev, "provider": "deterministic"}
+        except Exception:
+            logger.exception("deterministic evaluator failed")
 
-@legacy_router.post("/question")
-def legacy_question(req: SessionReq):
-    sess = _get_session(req.session_id)
-    ptr = sess["pointer"]
-    if ptr >= len(sess["questions"]):
-        raise HTTPException(status_code=404, detail="no more questions")
-    q = sess["questions"][ptr]
-    # do not advance pointer on question fetch; advance on answer
-    return {"status": "success", "data": {"question_id": q["question_id"], "question": q["question_text"], "current_index": q["current_index"], "total_questions": q["total_questions"]}}
-
-@legacy_router.post("/answer")
-def legacy_answer(req: AnswerReq):
-    sess = _get_session(req.session_id)
-    ptr = sess["pointer"]
-    if ptr >= len(sess["questions"]):
-        raise HTTPException(status_code=404, detail="session completed")
-    q = sess["questions"][ptr]
-    eval_res = deterministic_evaluate_answer(q["question_text"], req.answer)
-    # store
-    sess["history"].append({
-        "question_id": q["question_id"],
-        "question": q["question_text"],
-        "answer": req.answer,
-        "evaluation": eval_res,
-        "timestamp": time.time()
-    })
-    sess["pointer"] += 1
-    # prepare next question if any
-    next_q = None
-    if sess["pointer"] < len(sess["questions"]):
-        nq = sess["questions"][sess["pointer"]]
-        next_q = {"question_id": nq["question_id"], "question": nq["question_text"], "current_index": nq["current_index"], "total_questions": nq["total_questions"]}
-    else:
-        next_q = None
-    return {"status": "success", "data": {"evaluation": eval_res, "next_question": next_q, "session_id": sess["session_id"], "history_count": len(sess["history"]) } }
-
-@legacy_router.post("/end")
-def legacy_end(req: SessionReq):
-    sess = _get_session(req.session_id)
-    sess["finished"] = True
-    # compute report quick summary
-    scores = [h["evaluation"]["score"] for h in sess["history"] if h.get("evaluation")]
-    overall = int(round(sum(scores)/len(scores))) if scores else 0
-    sess["report"] = {
-        "overall_score": overall,
-        "questions": len(sess["questions"]),
-        "answered": len(sess["history"])
-    }
-    return {"status": "success", "data": {"session_id": sess["session_id"], "report": sess["report"]} }
-
-# mount legacy router to main router will be done by including both routers in main import
-router.include_router(legacy_router)
+    # Ultimate safe fallback
+    return {"ok": False, "evaluation": {"score": 0, "feedback": "Evaluation unavailable."}, "provider": "none"}
 
 
-# ---------- v2 endpoints (preferred paths) ----------
+# ----- Routes -----
+
+
 @router.post("/start-session")
-def start_session(payload: StartReq):
-    sess = _new_session(role=payload.role or "general", question_count=payload.question_count or 5, difficulty=payload.difficulty or "Medium", resume_id=payload.resume_id)
-    # Return a compact session summary
-    first_q = sess["questions"][0] if sess["questions"] else None
-    return {"status": "success", "data": {"session_id": sess["session_id"], "question": first_q["question_text"] if first_q else None, "role": sess["role"]}}
+def start_session(payload: StartSessionReq, db: Session = Depends(get_db)):
+    """
+    Start a deterministic-first/LLM-fallback mock session.
+    - Persists MockSession
+    - Stores requested question_count in-memory (no DB change)
+    - Returns first question
+    """
+    sid = str(uuid4())
+    session = MockSession(session_id=sid, role=payload.target_role or "general", current_q=0, finished=False)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
 
+    # Save meta for question count enforcement
+    _record_session_meta(sid, payload.question_count)
 
-@router.post("/{session_id}/next")
-def next_question(session_id: str):
-    sess = _get_session(session_id)
-    if sess["pointer"] >= len(sess["questions"]):
-        return {"status": "completed", "data": {"message": "No more questions"}}
-    q = sess["questions"][sess["pointer"]]
-    # Send question (UI expects question_id and text + progress)
-    return {
-        "question_id": q["question_id"],
-        "question_text": q["question_text"],
-        "current_index": q["current_index"],
-        "total_questions": q["total_questions"]
-    }
+    # Ask first question (LLM-first, fallback deterministic)
+    q = _ask_question_llm_or_fallback(role=payload.target_role or "general", difficulty=payload.difficulty)
 
-
-@router.post("/submit-answer")
-def submit_answer(payload: AnswerReq = Body(...)):
-    sess = _get_session(payload.session_id)
-    # If exchange_id provided, try to locate; else use pointer
-    ptr = sess["pointer"]
-    q = None
-    if payload.exchange_id:
-        for idx, qq in enumerate(sess["questions"]):
-            if qq["question_id"] == payload.exchange_id:
-                q = qq
-                ptr = idx
-                break
-    if not q:
-        if ptr >= len(sess["questions"]):
-            raise HTTPException(status_code=400, detail="session completed")
-        q = sess["questions"][ptr]
-
-    # Evaluate deterministically (fallback). Later replace with LLM-driven evaluation.
-    evaluation = deterministic_evaluate_answer(q["question_text"], payload.answer)
-
-    # store
-    sess["history"].append({
-        "question_id": q["question_id"],
-        "question": q["question_text"],
-        "answer": payload.answer,
-        "evaluation": evaluation,
-        "timestamp": time.time()
-    })
-
-    # advance pointer if this was the expected question
-    if ptr == sess["pointer"]:
-        sess["pointer"] = sess["pointer"] + 1
-
-    # prepare next question (if any)
-    next_q = None
-    if sess["pointer"] < len(sess["questions"]):
-        nq = sess["questions"][sess["pointer"]]
-        next_q = {
-            "question_id": nq["question_id"],
-            "question": nq["question_text"],
-            "current_index": nq["current_index"],
-            "total_questions": nq["total_questions"]
-        }
+    try:
+        _create_interaction(db, session, q["text"])
+        session.current_q = 1
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        _inc_asked(sid)
+    except Exception:
+        logger.exception("failed to persist first question interaction")
 
     return {
         "status": "success",
         "data": {
-            "evaluation": {
-                "score": evaluation["score"],
-                "strengths": evaluation["strengths"],
-                "weaknesses": evaluation["weaknesses"],
-                "feedback": evaluation["feedback"],
-                "metrics": evaluation["metrics"]
-            },
+            "session_id": sid,
+            "question": q["text"],
+            "role": payload.target_role or "general",
+            "provider": q.get("provider")
+        }
+    }
+
+
+@router.post("/{session_id}/next")
+def next_question(session_id: str, db: Session = Depends(get_db)):
+    """
+    Return the next question for a session.
+    If session has reached its requested question_count, return status: completed.
+    """
+    session = _get_session(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    # Check if we should finish based on requested count
+    if _should_finish(session_id):
+        return {"status": "completed"}
+
+    # Ask next question
+    q = _ask_question_llm_or_fallback(role=session.role or "general", difficulty=None)
+
+    try:
+        inter = _create_interaction(db, session, q["text"])
+        session.current_q = (session.current_q or 0) + 1
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        _inc_asked(session_id)
+    except Exception:
+        logger.exception("failed to persist next question")
+        inter = None
+
+    return {
+        "question_id": str(inter.id) if inter else None,
+        "question_text": q["text"],
+        "current_index": session.current_q,
+        "total_questions": _get_meta(session_id).get("total")
+    }
+
+
+@router.post("/submit-answer")
+def submit_answer(req: SubmitAnswerReq, db: Session = Depends(get_db)):
+    """
+    Submit an answer for the latest question of the session.
+    Flow:
+     - find session
+     - locate latest interaction without answer (or last interaction)
+     - persist answer
+     - evaluate via LLM-first then fallback deterministic
+     - persist feedback
+     - return evaluation + next_question (if any)
+    """
+    # Defensive validation + coercion
+    try:
+        # pydantic already validated presence of required fields; coerce exchange_id to str if present
+        exchange_id_raw = req.exchange_id
+        exchange_id = None
+        if exchange_id_raw is not None:
+            exchange_id = str(exchange_id_raw)
+    except ValidationError as ve:
+        logger.debug("validation error on submit-answer: %s", ve)
+        raise HTTPException(status_code=400, detail="Invalid request payload")
+
+    session = _get_session(db, req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    # Find last interaction for this session (most recent)
+    last_interaction = db.query(MockInteraction).filter(MockInteraction.session_id_fk == session.id).order_by(MockInteraction.created_at.desc()).first()
+    if not last_interaction:
+        # weird edge: create a placeholder
+        last_interaction = _create_interaction(db, session, "Question placeholder")
+
+    # If last_interaction already has answer, append a new interaction to store this answer
+    try:
+        if last_interaction.answer:
+            inter = _create_interaction(db, session, None, answer_text=req.answer)
+        else:
+            inter = last_interaction
+            inter.answer = req.answer
+            db.add(inter)
+            db.commit()
+            db.refresh(inter)
+    except Exception:
+        logger.exception("failed to persist answer to DB")
+        # return an explicit error payload the frontend can inspect
+        raise HTTPException(status_code=500, detail="Failed to save answer")
+
+    # Evaluate
+    try:
+        ev_res = _evaluate_answer_llm_or_fallback(answer=req.answer, role=session.role or "general")
+        evaluation = ev_res.get("evaluation", {})
+        provider = ev_res.get("provider", "none")
+    except Exception:
+        logger.exception("evaluation pipeline error")
+        evaluation = {"score": 0, "feedback": "Evaluation failed."}
+        provider = "none"
+
+    # Persist feedback
+    try:
+        fb = evaluation.get("feedback") if isinstance(evaluation, dict) else str(evaluation)
+        inter.feedback = fb
+        db.add(inter)
+        db.commit()
+        db.refresh(inter)
+    except Exception:
+        logger.exception("failed to save feedback")
+
+    # Decide whether to return next question or mark completed
+    if _should_finish(req.session_id):
+        # mark finished
+        try:
+            session.finished = True
+            db.add(session)
+            db.commit()
+        except Exception:
+            db.rollback()
+        next_q = None
+    else:
+        # Ask next question
+        q = _ask_question_llm_or_fallback(role=session.role or "general", difficulty=None)
+        try:
+            next_inter = _create_interaction(db, session, q["text"])
+            session.current_q = (session.current_q or 0) + 1
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            _inc_asked(req.session_id)
+            next_q = {"question_id": str(next_inter.id) if next_inter else None, "question": q["text"], "current_index": session.current_q, "total_questions": _get_meta(req.session_id).get("total")}
+        except Exception:
+            logger.exception("failed to persist next question after submit")
+            next_q = {"question_id": None, "question": "", "current_index": session.current_q, "total_questions": _get_meta(req.session_id).get("total")}
+
+    # Count answered history
+    try:
+        history_count = db.query(MockInteraction).filter(MockInteraction.session_id_fk == session.id, MockInteraction.answer != None).count()
+    except Exception:
+        logger.exception("failed counting history")
+        history_count = 0
+
+    return {
+        "status": "success",
+        "data": {
+            "evaluation": evaluation,
             "next_question": next_q,
-            "session_id": sess["session_id"],
-            "history_count": len(sess["history"])
+            "session_id": req.session_id,
+            "history_count": history_count,
+            "provider": provider
         }
     }
 
 
 @router.post("/{session_id}/end")
-def finish_session(session_id: str):
-    sess = _get_session(session_id)
-    sess["finished"] = True
-    # compute report: aggregate scores and provide quick items
-    scores = [h["evaluation"]["score"] for h in sess["history"] if h.get("evaluation")]
-    overall = int(round(sum(scores)/len(scores))) if scores else 0
-    # quick wins / issues heuristics
-    strengths = []
-    issues = []
-    for h in sess["history"]:
-        ev = h.get("evaluation", {})
-        for s in ev.get("strengths", []):
-            strengths.append(s)
-        for w in ev.get("weaknesses", []):
-            issues.append(w)
-
-    sess["report"] = {
-        "overall_score": overall,
-        "breakdown": {
-            "communication": overall,  # placeholder
-            "technical": overall,
-            "structure": overall
-        },
-        "insights": {
-            "good_points": list(dict.fromkeys(strengths))[:8],
-            "issues": list(dict.fromkeys(issues))[:12],
-            "overall_summary": f"Session completed. Average score {overall}."
-        },
-        "transcript": [{
-            "question": h["question"],
-            "user_answer": h["answer"],
-            "feedback": h["evaluation"]["feedback"],
-            "improved_answer": None  # placeholder for future LLM rewrite
-        } for h in sess["history"]]
-    }
-    return {"status": "success", "data": {"session_id": session_id, "summary": sess["report"]}}
+def end_session(session_id: str, db: Session = Depends(get_db)):
+    session = _get_session(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    session.finished = True
+    db.add(session)
+    db.commit()
+    # also remove meta
+    with _sessions_meta_lock:
+        _sessions_meta.pop(session_id, None)
+    return {"status": "success"}
 
 
 @router.get("/{session_id}/results")
-def get_results(session_id: str):
-    sess = _get_session(session_id)
-    if not sess.get("report"):
-        # if not yet finished, attempt a light finish
-        finish_session(session_id)
-    return {"status": "success", "data": sess["report"]}
+def get_results(session_id: str, db: Session = Depends(get_db)):
+    session = _get_session(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    interactions: List[MockInteraction] = db.query(MockInteraction).filter(MockInteraction.session_id_fk == session.id).order_by(MockInteraction.created_at.asc()).all()
+    transcript = []
+    scores = []
+    for item in interactions:
+        # attempt to parse "Score: <n>" from feedback
+        score = None
+        if item.feedback:
+            import re
+            m = re.search(r"Score[:\s]*([0-9]{1,3})", item.feedback)
+            if m:
+                try:
+                    score = int(m.group(1))
+                except Exception:
+                    score = None
+        if score is not None:
+            scores.append(score)
+
+        transcript.append({
+            "question": item.question or "",
+            "user_answer": item.answer or "",
+            "feedback": item.feedback or ""
+        })
+
+    overall_score = sum(scores) / len(scores) if scores else None
+
+    return {
+        "status": "success",
+        "data": {
+            "overall_score": overall_score,
+            "dimensions": {},
+            "feedback": {
+                "quick_wins": [],
+                "strengths": [],
+                "weaknesses": []
+            },
+            "transcript": transcript
+        }
+    }
 
 
-# Expose a tiny health endpoint to check sessions count
+# Debug route to view in-memory session meta (helpful during dev)
 @router.get("/_debug/sessions")
 def debug_sessions():
-    return {"count": len(SESSIONS), "sessions": list(SESSIONS.keys())}
+    with _sessions_meta_lock:
+        return {"sessions_meta": dict(_sessions_meta)}

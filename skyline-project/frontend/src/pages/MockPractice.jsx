@@ -1,364 +1,281 @@
 // src/pages/MockPractice.jsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import axios from "axios";
 import toast from "react-hot-toast";
-import { FaPlay } from "react-icons/fa";
-import { useNavigate } from "react-router-dom";
+import { motion } from "framer-motion";
 
 import ChatTimeline from "../components/mock/ChatTimeline";
 import SidebarStatus from "../components/mock/SidebarStatus";
 import AnswerBar from "../components/mock/AnswerBar";
 import TypingIndicator from "../components/mock/TypingIndicator";
+import MockResult from "../components/mock/MockResult";
+import "../components/mock/mock_result.css"; // ensures confetti/pulse styles are available
 
-/**
- * MockPractice.jsx
- *
- * Features:
- * - Setup screen (role, difficulty, question count, optional resume)
- * - Intro screen (confirm & start)
- * - Interview loop (fetch question -> user answer -> evaluate -> next)
- * - Analyzing -> navigates to MockResult (report saved to sessionStorage)
- *
- * Endpoints (tries multiple fallbacks):
- * - Start:     POST /mock/start  OR  POST /api/mock-v2/start-session
- * - Next Q:    POST /mock/question OR POST /api/mock-v2/{session}/next
- * - Answer:    POST /mock/answer   OR POST /api/mock-v2/submit-answer
- * - End/Report: POST /mock/end + GET /mock/result  OR POST /api/mock-v2/{session}/end + GET /api/mock-v2/{session}/results
- *
- * This component is defensive about response shapes and will show toast errors when network calls fail.
- */
-
-export default function MockPractice() {
-  const navigate = useNavigate();
-
-  // Modes: 'setup' | 'intro' | 'interview' | 'analyzing'
+function MockPractice() {
+  // Modes: 'setup' | 'intro' | 'interview' | 'analyzing' | 'result'
   const [mode, setMode] = useState("setup");
 
-  // Config & resources
+  // session config
   const [sessionConfig, setSessionConfig] = useState({
     target_role: "",
     difficulty: "Medium",
     question_count: 5,
     resume_id: ""
   });
+
   const [resumes, setResumes] = useState([]);
 
-  // Interview state
+  // session runtime
   const [sessionId, setSessionId] = useState(null);
-  const [messages, setMessages] = useState([]); // {id, type: 'ai'|'user'|'feedback', text}
-  const [currentQ, setCurrentQ] = useState(null); // normalized {question_id, question_text, current_index, total_questions}
+  const [currentQuestion, setCurrentQuestion] = useState(null);
+  const [messages, setMessages] = useState([]); // [{id, type, text}]
   const [isTyping, setIsTyping] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
-  // Report placeholder (kept in sessionStorage on finish)
+  // results
   const [report, setReport] = useState(null);
 
-  const mountedRef = useRef(true);
+  const timelineRef = useRef(null);
+
+  // Load saved resumes for optional personalization
   useEffect(() => {
-    return () => {
-      mountedRef.current = false;
-    };
+    let mounted = true;
+    axios.get("/profile/resumes")
+      .then((res) => {
+        if (!mounted) return;
+        const payload = res?.data ?? [];
+        // Normalize — ensure an array is set
+        setResumes(Array.isArray(payload) ? payload : (payload && payload.data && Array.isArray(payload.data) ? payload.data : []));
+      })
+      .catch((err) => {
+        // silent fallback, but keep resumes as array
+        console.debug("[MockPractice] could not load resumes", err?.message || err);
+        setResumes([]);
+      });
+    return () => { mounted = false; };
   }, []);
 
-  // load resumes (non-critical)
-  useEffect(() => {
-    (async () => {
-      try {
-        const tryUrls = ["/api/profile/resumes", "/profile/resumes"];
-        for (const url of tryUrls) {
-          try {
-            const res = await axios.get(url);
-            const payload = res?.data?.data ?? res?.data;
-            if (Array.isArray(payload)) {
-              setResumes(payload);
-              break;
-            }
-          } catch {
-            // try next
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    })();
-  }, []);
+  // Small helper to push chat messages
+  const pushMessage = (msg) => setMessages(prev => [...prev, msg]);
 
-  // UI helper: push a timeline message
-  const pushMessage = (msg) => setMessages((prev) => [...prev, msg]);
-
-  // --- Endpoint helpers (try multiple endpoints/fallbacks) ---
-  const startSessionRequest = async (cfg) => {
-    const payload = {
-      role: cfg.target_role,
-      difficulty: cfg.difficulty,
-      question_count: cfg.question_count,
-      resume_id: cfg.resume_id || null
-    };
-
-    const attempts = [
-      { method: "post", url: "/mock/start", data: payload },
-      { method: "post", url: "/api/mock-v2/start-session", data: payload },
-      { method: "post", url: "/mock-v2/start-session", data: payload },
-    ];
-
-    for (const a of attempts) {
-      try {
-        const r = await axios[a.method](a.url, a.data);
-        // Normalize response shape: prefer r.data.data or r.data
-        const body = r?.data?.data ?? r?.data;
-        if (body) return body;
-      } catch (e) {
-        // continue
-      }
-    }
-    throw new Error("No start endpoint reachable");
-  };
-
-  const fetchNextQuestionRequest = async (sid) => {
-    const attempts = [
-      { method: "post", url: "/mock/question", data: { session_id: sid } },
-      { method: "post", url: `/mock-v2/${sid}/next`, data: {} },
-      { method: "post", url: `/api/mock-v2/${sid}/next`, data: {} },
-    ];
-
-    for (const a of attempts) {
-      try {
-        const r = await axios[a.method](a.url, a.data);
-        const body = r?.data?.data ?? r?.data;
-        if (body) return body;
-      } catch (e) {}
-    }
-    throw new Error("No next-question endpoint reachable");
-  };
-
-  const submitAnswerRequest = async (sid, exchangeId, answerText) => {
-    const attempts = [
-      { method: "post", url: "/mock/answer", data: { session_id: sid, answer: answerText } },
-      { method: "post", url: "/mock/answer", data: { session_id: sid, answer_text: answerText } }, // older variations
-      { method: "post", url: "/api/mock-v2/submit-answer", data: { exchange_id: exchangeId, user_answer: answerText } },
-      { method: "post", url: "/mock-v2/submit-answer", data: { exchange_id: exchangeId, user_answer: answerText } },
-    ];
-
-    for (const a of attempts) {
-      try {
-        const r = await axios[a.method](a.url, a.data);
-        const body = r?.data?.data ?? r?.data;
-        if (body) return body;
-      } catch (e) {}
-    }
-    throw new Error("No submit-answer endpoint reachable");
-  };
-
-  const endSessionAndFetchReport = async (sid) => {
-    const attempts = [
-      { method: "post", url: "/mock/end", data: { session_id: sid } },
-      { method: "post", url: `/mock-v2/${sid}/end`, data: {} },
-      { method: "post", url: `/api/mock-v2/${sid}/end`, data: {} },
-    ];
-    // try to call end first (best-effort)
-    for (const a of attempts) {
-      try {
-        await axios[a.method](a.url, a.data);
-        break;
-      } catch (e) {}
-    }
-
-    // fetch result
-    const fetches = [
-      { method: "get", url: "/mock/result" },
-      { method: "get", url: `/mock-v2/${sid}/results` },
-      { method: "get", url: `/api/mock-v2/${sid}/results` },
-    ];
-    for (const f of fetches) {
-      try {
-        const r = await axios[f.method](f.url);
-        const body = r?.data?.data ?? r?.data;
-        if (body) return body;
-      } catch (e) {}
-    }
-    throw new Error("No results endpoint reachable");
-  };
-
-  // --- Flow actions ---
-  const handleStartSession = async () => {
-    if (!sessionConfig.target_role || !sessionConfig.target_role.trim()) {
-      toast.error("Please enter a target role.");
+  // ----------------------------
+  // START SESSION
+  // ----------------------------
+  const startSession = async () => {
+    if (!sessionConfig.target_role || sessionConfig.target_role.trim() === "") {
+      toast.error?.("Target role is required") || alert("Target role is required");
       return;
     }
 
-    setIsLoading(true);
-    setMessages([]);
-    setCurrentQ(null);
-    setSessionId(null);
-
     try {
-      const resp = await startSessionRequest(sessionConfig);
-      // possible shapes:
-      // { session_id, question, role }  OR { id, first_question... } OR whole session object
-      const sid = resp.session_id ?? resp.id ?? resp.session?.id ?? null;
-      const firstQuestionText = resp.question ?? resp.first_question ?? resp.question_text ?? (resp.data && resp.data.question);
-      setSessionId(sid);
-      // If server returned an opening question, push to timeline and also set currentQ
-      if (firstQuestionText) {
-        const qid = resp.question_id ?? resp.question_id ?? `q-${Date.now()}`;
-        const normalized = {
-          question_id: qid,
-          question_text: firstQuestionText,
-          current_index: 1,
-          total_questions: sessionConfig.question_count
-        };
-        setCurrentQ(normalized);
-        pushMessage({ id: `q-${qid}`, type: "ai", text: firstQuestionText });
+      setIsLoading(true);
+      const payload = {
+        target_role: sessionConfig.target_role,
+        difficulty: sessionConfig.difficulty,
+        question_count: sessionConfig.question_count,
+        resume_id: sessionConfig.resume_id || null
+      };
+
+      const res = await axios.post("/mock-v2/start-session", payload);
+      const data = (res.data && (res.data.data || res.data)) || {};
+      const sid = data.session_id || data.id || data.sessionId || null;
+      if (!sid) {
+        console.warn("[startSession] no session id returned", res.data);
+        toast.error("Failed to start session (no session id returned)");
+        return;
       }
-      // move to intro briefly for UX, then interview
+      setSessionId(sid);
+
+      // initial first question (the start endpoint often returns a question)
+      if (data.question) {
+        const qObj = {
+          question_id: data.question_id || `q-0`,
+          question_text: data.question,
+          current_index: data.current_index || 1,
+          total_questions: data.total_questions || sessionConfig.question_count
+        };
+        setCurrentQuestion(qObj);
+        pushMessage({ id: qObj.question_id, type: "ai", text: qObj.question_text });
+      }
+
+      // go to intro — then interview on user click
       setMode("intro");
-      setTimeout(() => setMode("interview"), 800);
-      toast.success("Session started");
     } catch (err) {
-      console.error("Start session failed:", err);
-      toast.error("Could not start session. Check backend.");
+      console.error("startSession error", err?.response?.data || err.message || err);
+      toast.error?.("Failed to start session");
     } finally {
-      if (mountedRef.current) setIsLoading(false);
+      setIsLoading(false);
     }
   };
 
-  // fetch next question and show typing indicator
+  const beginInterview = () => {
+    setMode("interview");
+    // If no current question preloaded, fetch next
+    if (!currentQuestion) {
+      fetchNextQuestion();
+    }
+  };
+
+  // ----------------------------
+  // FETCH NEXT QUESTION
+  // ----------------------------
   const fetchNextQuestion = async () => {
     if (!sessionId) {
-      toast.error("No active session.");
+      toast.error?.("Session not started");
       return;
     }
     setIsTyping(true);
-    setIsLoading(true);
+    setCurrentQuestion(null);
+
     try {
-      const resp = await fetchNextQuestionRequest(sessionId);
-      // If server signals completed
-      if (resp.status === "completed" || resp.completed === true || resp.done === true) {
-        // generate final report
-        await handleFinishSession();
+      const res = await axios.post(`/mock-v2/${sessionId}/next`);
+      const payload = (res.data && (res.data.data || res.data)) || {};
+
+      if (payload.status === "completed" || payload === "completed") {
+        // backend suggests finished — generate final report
+        await generateReport();
         return;
       }
 
-      // Normalize question
-      const qtext = resp.question_text ?? resp.question ?? resp.q ?? resp.question_text;
-      const qid = resp.question_id ?? resp.id ?? `q-${Date.now()}`;
-      const normalized = {
-        question_id: qid,
-        question_text: qtext,
-        current_index: resp.current_index ?? (currentQ ? (currentQ.current_index + 1) : 1),
-        total_questions: resp.total_questions ?? sessionConfig.question_count
+      // expected shape: { question_id, question, current_index, total_questions }
+      const q = {
+        question_id: payload.question_id || payload.questionId || `q-${Date.now()}`,
+        question_text: payload.question || payload.question_text || payload.question_text || "",
+        current_index: payload.current_index || payload.currentIndex || 1,
+        total_questions: payload.total_questions || payload.totalQuestions || sessionConfig.question_count
       };
+
+      setCurrentQuestion(q);
+
+      // small typing delay then push message
       setTimeout(() => {
-        pushMessage({ id: `q-${qid}`, type: "ai", text: qtext });
-        setCurrentQ(normalized);
+        if (q.question_text) pushMessage({ id: `q-${q.question_id}`, type: "ai", text: q.question_text });
+        else pushMessage({ id: `q-${q.question_id}`, type: "ai", text: "Question unavailable" });
         setIsTyping(false);
-      }, 600); // small delay for UX
+      }, 700);
+
     } catch (err) {
-      console.error("Next question failed:", err);
+      console.error("fetchNextQuestion error", err?.response?.data || err.message || err);
+      toast.error?.("Failed to fetch next question");
       setIsTyping(false);
-      toast.error("Could not fetch next question.");
-    } finally {
-      if (mountedRef.current) setIsLoading(false);
     }
   };
 
+  // ----------------------------
+  // SUBMIT ANSWER
+  // ----------------------------
   const handleSubmitAnswer = async (answerText) => {
-    if (!currentQ) {
-      toast.error("No active question.");
-      return;
-    }
-    if (!answerText || !answerText.trim()) {
-      toast.error("Please type an answer before submitting.");
+    if (!currentQuestion) {
+      toast.error?.("No active question");
       return;
     }
 
-    // push user message to timeline
-    pushMessage({ id: `u-${currentQ.question_id}`, type: "user", text: answerText });
+    const exchange_id = currentQuestion.question_id;
+    // push user's message to timeline
+    pushMessage({ id: `u-${exchange_id}`, type: "user", text: answerText });
 
-    setIsLoading(true);
-    setIsTyping(true);
-
+    // call submit
     try {
-      const resp = await submitAnswerRequest(sessionId, currentQ.question_id, answerText);
+      setIsLoading(true);
+      const res = await axios.post("/mock-v2/submit-answer", {
+        session_id: sessionId,
+        exchange_id: exchange_id,
+        answer: answerText
+      });
 
-      // resp likely contains evaluation and next_question
-      // shapes seen: { evaluation: {...}, next_question: {...}, session_id, history_count }
-      const evaluation = resp.evaluation ?? resp.feedback ?? resp.result ?? (resp.data && resp.data.evaluation) ?? null;
-      const feedbackText = evaluation?.feedback ?? evaluation?.score ? `Score: ${evaluation.score}` : (resp.feedback_text || resp.message || (evaluation && JSON.stringify(evaluation)));
+      const payload = (res.data && (res.data.data || res.data)) || {};
 
-      // push feedback micro message
-      pushMessage({ id: `fb-${currentQ.question_id}`, type: "feedback", text: feedbackText || "Feedback received." });
+      // feedback might be string or object
+      const fbText = payload?.evaluation?.feedback || payload?.feedback || payload?.evaluation?.message || payload?.message || "Feedback unavailable";
 
-      // if server supplied next question inline, use it, otherwise call next
-      const nextQ = resp.next_question ?? resp.next ?? resp.question ?? null;
-      if (nextQ && (nextQ.question || nextQ.question_text || nextQ.question_id)) {
-        const qtext = nextQ.question_text ?? nextQ.question ?? nextQ.q;
-        const qid = nextQ.question_id ?? nextQ.id ?? `q-${Date.now()}`;
-        const normalized = {
-          question_id: qid,
-          question_text: qtext,
-          current_index: nextQ.current_index ?? (currentQ.current_index + 1),
-          total_questions: nextQ.total_questions ?? sessionConfig.question_count
-        };
+      // push feedback block
+      pushMessage({ id: `fb-${exchange_id}`, type: "feedback", text: fbText });
+
+      // schedule fetch next question (or results if finished)
+      const next = payload?.next_question || payload?.nextQuestion || null;
+
+      if (next && (next.question || next.question_text)) {
+        // small delay to let user read feedback
         setTimeout(() => {
-          pushMessage({ id: `q-${qid}`, type: "ai", text: qtext });
-          setCurrentQ(normalized);
-          setIsTyping(false);
-        }, 800);
-      } else {
-        // call server for next question (server may manage sequence)
-        setTimeout(() => {
-          setIsTyping(false);
-          fetchNextQuestion();
+          const nq = next;
+          setCurrentQuestion({
+            question_id: nq.question_id || nq.questionId,
+            question_text: nq.question || nq.question_text || nq.questionText || "",
+            current_index: nq.current_index || nq.currentIndex || 1,
+            total_questions: nq.total_questions || nq.totalQuestions || sessionConfig.question_count
+          });
+          pushMessage({ id: `q-${nq.question_id || Date.now()}`, type: "ai", text: nq.question || nq.question_text || "" });
         }, 900);
+      } else if (next === "completed" || payload?.status === "completed") {
+        // session complete
+        await generateReport();
+      } else if (payload?.session_id && (payload.history_count >= (sessionConfig.question_count || 1))) {
+        // if backend gives history_count reaching target, finalize
+        await generateReport();
+      } else {
+        // default fallback: try to fetch next question after a small pause
+        setTimeout(() => fetchNextQuestion(), 900);
       }
+
     } catch (err) {
-      console.error("Submit answer failed:", err);
-      pushMessage({ id: `fb-${currentQ.question_id}`, type: "feedback", text: "Evaluation failed. Try next question." });
-      setIsTyping(false);
-      toast.error("Answer submission failed.");
+      console.error("submit-answer error", err?.response?.data || err.message || err);
+      const detail = err?.response?.data || err?.message;
+      // show a helpful message if it's a 404 / session not found
+      if (err?.response?.status === 404) {
+        toast.error("Session not found. Please restart.");
+        handleRestart();
+      } else {
+        toast.error?.("Failed to submit answer");
+      }
     } finally {
-      if (mountedRef.current) setIsLoading(false);
+      setIsLoading(false);
     }
   };
 
-  // finish and fetch report, then navigate to results page
-  const handleFinishSession = async () => {
-    if (!sessionId) {
-      toast.error("No active session to finalize.");
-      return;
-    }
+  // ----------------------------
+  // GENERATE FINAL REPORT
+  // ----------------------------
+  const generateReport = async () => {
+    if (!sessionId) return;
+
     setMode("analyzing");
     setIsLoading(true);
+
     try {
-      const rpt = await endSessionAndFetchReport(sessionId);
-      // Save in session storage for MockResult to pick up (and for page reload)
+      // Trigger end on server (some implementations require it)
       try {
-        sessionStorage.setItem("mock_report", JSON.stringify(rpt));
-      } catch {}
-      setReport(rpt);
-      // navigate to MockResult page (ensure route exists)
-      navigate("/mock-result", { state: { report: rpt } });
-    } catch (err) {
-      console.error("Finish session failed:", err);
-      toast.error("Could not generate final report.");
-      // still attempt to navigate with whatever we have
-      try {
-        const maybeSaved = sessionStorage.getItem("mock_report");
-        if (maybeSaved) {
-          navigate("/mock-result");
-        } else {
-          setMode("setup");
-        }
-      } catch {
-        setMode("setup");
+        await axios.post(`/mock-v2/${sessionId}/end`);
+      } catch (e) {
+        // non-fatal: some versions return 404 if already finished — continue
+        console.debug("[generateReport] end() call non-fatal:", e?.response?.status || e?.message);
       }
+
+      const res = await axios.get(`/mock-v2/${sessionId}/results`);
+      const payload = (res.data && (res.data.data || res.data)) || {};
+      setReport(payload);
+      setMode("result");
+    } catch (err) {
+      console.error("generateReport error", err?.response?.data || err.message || err);
+      toast.error?.("Scoring failed. Try again.");
+      setMode("result");
+      setReport(null);
     } finally {
-      if (mountedRef.current) setIsLoading(false);
+      setIsLoading(false);
     }
   };
 
-  // UI renderers
+  const handleRestart = () => {
+    setMode("setup");
+    setSessionId(null);
+    setCurrentQuestion(null);
+    setMessages([]);
+    setReport(null);
+    setIsTyping(false);
+  };
+
+  // ----------------------------
+  // UI RENDERS
+  // ----------------------------
   if (mode === "setup") {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-gray-50 to-indigo-100 p-6">
@@ -366,17 +283,18 @@ export default function MockPractice() {
           <div className="p-10 bg-indigo-600 text-white rounded-l-3xl flex flex-col justify-between">
             <div>
               <h1 className="text-4xl font-bold mb-4">Mock Interview</h1>
-              <p className="text-indigo-200 text-lg">Practice real interview questions with AI-driven feedback.</p>
+              <p className="text-indigo-200 text-lg">Practice real interview questions with AI.</p>
             </div>
-            <ul className="space-y-3 mt-10 text-indigo-100">
-              <li>Role-specific adaptive questions</li>
-              <li>Real-time micro-feedback</li>
-              <li>Final performance report</li>
+
+            <ul className="space-y-3 mt-10 text-sm">
+              <li className="flex items-center gap-3"><span className="w-3 h-3 bg-white rounded-full"></span> Role-specific adaptive questions</li>
+              <li className="flex items-center gap-3"><span className="w-3 h-3 bg-white rounded-full"></span> Real-time AI micro-feedback</li>
+              <li className="flex items-center gap-3"><span className="w-3 h-3 bg-white rounded-full"></span> Full performance report at the end</li>
             </ul>
           </div>
 
           <div className="p-10">
-            <h2 className="text-2xl font-bold mb-6">Configure Interview</h2>
+            <h2 className="text-2xl font-bold mb-6">Configure Session</h2>
 
             <div className="space-y-6">
               <div>
@@ -392,16 +310,18 @@ export default function MockPractice() {
               <div className="grid grid-cols-2 gap-6">
                 <div>
                   <label className="font-bold text-gray-700">Difficulty</label>
-                  <select className="mt-2 w-full p-3 border rounded-xl" value={sessionConfig.difficulty} onChange={(e) => setSessionConfig({ ...sessionConfig, difficulty: e.target.value })}>
-                    <option>Easy</option>
-                    <option>Medium</option>
-                    <option>Hard</option>
+                  <select className="mt-2 w-full p-3 border rounded-xl"
+                    value={sessionConfig.difficulty}
+                    onChange={(e) => setSessionConfig({ ...sessionConfig, difficulty: e.target.value })}>
+                    <option>Easy</option><option>Medium</option><option>Hard</option>
                   </select>
                 </div>
 
                 <div>
                   <label className="font-bold text-gray-700">Number of Questions</label>
-                  <select className="mt-2 w-full p-3 border rounded-xl" value={sessionConfig.question_count} onChange={(e) => setSessionConfig({ ...sessionConfig, question_count: parseInt(e.target.value) })}>
+                  <select className="mt-2 w-full p-3 border rounded-xl"
+                    value={sessionConfig.question_count}
+                    onChange={(e) => setSessionConfig({ ...sessionConfig, question_count: parseInt(e.target.value) })}>
                     <option value="3">3 (Quick)</option>
                     <option value="5">5 (Standard)</option>
                     <option value="8">8 (Deep)</option>
@@ -410,19 +330,20 @@ export default function MockPractice() {
               </div>
 
               <div>
-                <label className="font-bold text-gray-700">Use Resume? (optional)</label>
-                {resumes.length ? (
-                  <select className="mt-2 w-full p-3 border rounded-xl" value={sessionConfig.resume_id} onChange={(e) => setSessionConfig({ ...sessionConfig, resume_id: e.target.value })}>
-                    <option value="">None</option>
-                    {resumes.map((r) => <option key={r.id} value={r.id}>{r.filename}</option>)}
-                  </select>
-                ) : (
-                  <div className="mt-2 p-3 bg-gray-50 rounded-xl text-sm text-gray-500 border border-dashed">No uploaded resumes found. You can proceed without one.</div>
-                )}
+                <label className="font-bold text-gray-700">Use Resume? (Optional)</label>
+                <select className="mt-2 w-full p-3 border rounded-xl"
+                  value={sessionConfig.resume_id}
+                  onChange={(e) => setSessionConfig({ ...sessionConfig, resume_id: e.target.value })}>
+                  <option value="">None</option>
+                  {resumes && resumes.length > 0 ? resumes.map((r) => (
+                    <option key={r.id} value={r.id}>{r.filename}</option>
+                  )) : <option disabled>No resumes available</option>}
+                </select>
               </div>
 
-              <button onClick={handleStartSession} className="mt-4 w-full py-4 bg-indigo-600 text-white rounded-xl font-bold text-lg hover:bg-indigo-700 flex items-center justify-center gap-2">
-                <FaPlay /> Start Interview
+              <button onClick={startSession}
+                className="mt-4 w-full py-4 bg-indigo-600 text-white rounded-xl font-bold text-lg hover:bg-indigo-700">
+                {isLoading ? "Starting..." : "Start Interview"}
               </button>
             </div>
           </div>
@@ -431,57 +352,66 @@ export default function MockPractice() {
     );
   }
 
+  // INTRO
   if (mode === "intro") {
     return (
-      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center p-6 text-center">
-        <div className="max-w-xl">
+      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-6 text-center">
+        <motion.div initial={{ scale: 0.98, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="max-w-xl">
           <div className="w-20 h-20 bg-indigo-500 rounded-full flex items-center justify-center mx-auto mb-6 text-3xl">AI</div>
           <h1 className="text-4xl font-bold mb-4">Get Ready!</h1>
           <p className="text-xl text-gray-300 mb-8">You are about to start a <strong>{sessionConfig.difficulty}</strong> interview for <strong>{sessionConfig.target_role}</strong>.</p>
-          <button className="px-10 py-4 bg-white text-indigo-900 font-bold rounded-full text-lg hover:scale-105 transition shadow-lg" onClick={() => { setMode("interview"); /* if server returned first question already, we will show it, else fetch next */ if (!currentQ) setTimeout(() => fetchNextQuestion(), 350); }}>
+          <button onClick={beginInterview} className="px-10 py-4 bg-white text-indigo-900 font-bold rounded-full text-lg hover:scale-105 transition shadow-lg">
             Start Interview
           </button>
-        </div>
+        </motion.div>
       </div>
     );
   }
 
+  // INTERVIEW (chat-like)
   if (mode === "interview") {
     return (
-      <div className="min-h-screen bg-gray-50 flex">
+      <div className="min-h-screen flex bg-gray-50">
         <SidebarStatus
-          currentIndex={currentQ?.current_index ?? 0}
-          total={currentQ?.total_questions ?? sessionConfig.question_count}
+          currentIndex={currentQuestion?.current_index || 0}
+          total={currentQuestion?.total_questions || sessionConfig.question_count}
           difficulty={sessionConfig.difficulty}
           role={sessionConfig.target_role}
         />
 
         <div className="flex-grow flex flex-col">
-          <div className="flex-grow overflow-y-auto p-8 pb-32">
+          <div className="flex-grow overflow-y-auto p-8 pb-40" ref={timelineRef}>
             <ChatTimeline messages={messages} />
             {isTyping && <TypingIndicator />}
           </div>
 
-          <AnswerBar
-            onSubmit={(text) => handleSubmitAnswer(text)}
-            placeholder={isLoading ? "Processing..." : "Type your answer... (Shift+Enter for newline)"}
-          />
+          <AnswerBar onSubmit={handleSubmitAnswer} placeholder="Type your answer..." isLoading={isLoading}/>
         </div>
       </div>
     );
   }
 
-  // analyzing is short-lived (we navigate to MockResult after fetching)
+  // ANALYZING (waiting for report)
   if (mode === "analyzing") {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center text-center bg-gray-50 p-6">
-        <div className="w-20 h-20 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-6"></div>
-        <h2 className="text-2xl font-bold text-gray-700">Generating your interview report…</h2>
-        <p className="text-gray-500 mt-2">We are compiling scores, suggested improvements and an overall summary.</p>
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6 text-center">
+        <div className="w-24 h-24 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-6"></div>
+        <h2 className="text-2xl font-bold text-gray-800">Generating Performance Report...</h2>
+        <p className="text-gray-500 mt-2">AI is rewriting your answers and calculating scores.</p>
       </div>
     );
   }
 
-  // fallback
+  // RESULT
+  if (mode === "result") {
+    return (
+      <div className="min-h-screen bg-gray-50 p-6 md:p-10">
+        <MockResult report={report || {}} onRestart={handleRestart} />
+      </div>
+    );
+  }
+
   return null;
 }
+
+export default MockPractice;

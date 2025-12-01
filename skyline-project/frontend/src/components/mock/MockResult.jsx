@@ -1,204 +1,206 @@
-// frontend/src/components/mock/MockResult.jsx
+// src/components/mock/MockResult.jsx
+import React, { useEffect, useRef, useState } from "react";
+import PropTypes from "prop-types";
+import { FaClipboard, FaRedo } from "react-icons/fa";
+import "./mock_result.css";
 
-import React from "react";
-import { motion } from "framer-motion";
-import { FaCheckCircle, FaExclamationTriangle, FaCopy } from "react-icons/fa";
-import toast from "react-hot-toast";
+/**
+ * MockResult
+ * Props:
+ *  - report: {
+ *      overall_score: number (0-100) | null,
+ *      dimensions: { clarity: 80, impact: 60, ... },
+ *      feedback: { quick_wins: [], strengths: [], weaknesses: [] },
+ *      transcript: [{ question, user_answer, improved_answer, feedback }]
+ *    }
+ *  - onRestart(): callback to restart a session
+ */
+export default function MockResult({ report = {}, onRestart = () => {} }) {
+  const score = report.overall_score ?? null;
+  const celebrate = score !== null && score >= 75;
+  const confettiRef = useRef(null);
+  const [copied, setCopied] = useState(false);
 
-export default function MockResult({ report, onRestart }) {
-  if (!report) return null;
+  useEffect(() => {
+    if (celebrate) {
+      // trigger CSS confetti burst by adding a class briefly
+      const el = confettiRef.current;
+      if (!el) return;
+      el.classList.remove("confetti-burst");
+      // allow reflow
+      // eslint-disable-next-line no-unused-expressions
+      el.offsetWidth;
+      el.classList.add("confetti-burst");
+    }
+  }, [celebrate, score]);
 
-  const score = report.overall_score || 0;
-  const transcript = report.transcript || [];
-  const role = report.role || "Interview";
-
-  // Gauge stroke calculation
-  const circumference = 2 * Math.PI * 60;
-  const strokeDashoffset = circumference - (score / 100) * circumference;
+  const copySummary = async () => {
+    const text = generateSummary(report);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-gray-50 p-6 md:p-10">
-      <div className="max-w-6xl mx-auto space-y-10">
-        {/* Header */}
-        <div className="flex justify-between items-center">
-          <div>
-            <h1 className="text-3xl font-bold text-gray-900">Interview Results</h1>
-            <p className="text-gray-600">Role: {role}</p>
-          </div>
-
-          <button
-            onClick={onRestart}
-            className="bg-white border border-gray-300 text-gray-700 px-6 py-2 rounded-lg hover:bg-gray-100"
-          >
-            Back to Mock Practice
-          </button>
-        </div>
-
-        {/* Overall Score Gauge */}
-        <motion.div
-          initial={{ opacity: 0, scale: 0.92 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="bg-white p-10 rounded-3xl shadow-sm border flex flex-col items-center"
-        >
-          <h2 className="text-gray-500 text-sm font-semibold uppercase tracking-wide">
-            Overall Performance
-          </h2>
-
-          <div className="relative w-48 h-48 my-6">
-            <svg className="w-full h-full transform -rotate-90">
+    <div className="max-w-6xl mx-auto p-6">
+      <div className="bg-white rounded-2xl shadow-sm p-6 grid md:grid-cols-3 gap-6 items-center">
+        {/* SCORE CARD */}
+        <div className="flex flex-col items-center justify-center gap-4">
+          <div className="relative">
+            <svg className="w-40 h-40" viewBox="0 0 120 120" aria-hidden>
+              <defs>
+                <linearGradient id="grad" x1="0" x2="1">
+                  <stop offset="0%" stopColor="#4F46E5" />
+                  <stop offset="100%" stopColor="#06b6d4" />
+                </linearGradient>
+              </defs>
+              <circle cx="60" cy="60" r="48" stroke="#EEF2FF" strokeWidth="18" fill="none" />
               <circle
                 cx="60"
                 cy="60"
-                r="60"
-                stroke="#E5E7EB"
-                strokeWidth="12"
-                fill="none"
-              />
-              <motion.circle
-                cx="60"
-                cy="60"
-                r="60"
-                stroke="#6366F1"
-                strokeWidth="12"
-                fill="none"
-                strokeDasharray={circumference}
-                strokeDashoffset={circumference}
-                animate={{ strokeDashoffset }}
-                transition={{ duration: 1.2, ease: "easeInOut" }}
+                r="48"
+                stroke="url(#grad)"
+                strokeWidth="18"
                 strokeLinecap="round"
+                fill="none"
+                strokeDasharray={`${score ?? 0} ${100 - (score ?? 0)}`}
+                transform="rotate(-90 60 60)"
               />
             </svg>
 
-            <div className="absolute inset-0 flex items-center justify-center">
-              <span className="text-4xl font-bold text-indigo-600">{score}</span>
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+              <div className={`text-4xl font-extrabold ${score >= 60 ? "text-indigo-900" : "text-gray-800"}`}>
+                {score === null ? "—" : `${score}`}
+              </div>
+              <div className="text-sm text-gray-500 mt-1">Overall Score</div>
+            </div>
+
+            {/* confetti container */}
+            <div ref={confettiRef} className="confetti-container pointer-events-none" aria-hidden />
+          </div>
+
+          <div className="flex gap-2">
+            <button
+              onClick={copySummary}
+              className="bg-indigo-600 text-white px-4 py-2 rounded-md flex items-center gap-2 hover:bg-indigo-700"
+              aria-label="Copy summary"
+            >
+              <FaClipboard /> <span className="hidden sm:inline">{copied ? "Copied" : "Copy summary"}</span>
+            </button>
+
+            <button
+              onClick={onRestart}
+              className="bg-white border border-gray-200 px-4 py-2 rounded-md flex items-center gap-2 hover:bg-gray-50"
+            >
+              <FaRedo /> Restart
+            </button>
+          </div>
+        </div>
+
+        {/* PERFORMANCE BREAKDOWN */}
+        <div className="md:col-span-2">
+          <h3 className="text-lg font-semibold text-gray-800 mb-4">Performance breakdown</h3>
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="bg-gray-50 p-4 rounded-lg">
+              <h4 className="text-sm font-medium text-gray-600 mb-3">Key dimensions</h4>
+              <div className="space-y-3">
+                {report.dimensions && Object.keys(report.dimensions).length > 0 ? (
+                  Object.entries(report.dimensions).map(([k, v]) => (
+                    <div key={k}>
+                      <div className="flex justify-between text-xs font-medium text-gray-700 mb-1">
+                        <span className="capitalize">{k.replace(/_/g, " ")}</span>
+                        <span>{v}%</span>
+                      </div>
+                      <div className="w-full bg-white rounded-full h-2.5">
+                        <div className="bg-indigo-600 h-2.5 rounded-full" style={{ width: `${v}%` }} />
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-gray-500">No dimension data available.</div>
+                )}
+              </div>
+            </div>
+
+            <div className="bg-white p-4 rounded-lg border">
+              <h4 className="text-sm font-medium text-gray-600 mb-3">Quick wins</h4>
+              {report.feedback && report.feedback.quick_wins && report.feedback.quick_wins.length > 0 ? (
+                <ul className="space-y-2">
+                  {report.feedback.quick_wins.map((w, i) => (
+                    <li key={i} className="text-sm bg-indigo-50 p-2 rounded-md">
+                      <strong className="text-indigo-800">{w.title || "Tip"}</strong>
+                      <div className="text-xs text-indigo-700">{w.description || w}</div>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="text-sm text-gray-500">No quick wins found.</div>
+              )}
             </div>
           </div>
 
-          {/* Small celebratory animation for > 70 */}
-          {score >= 70 && (
-            <motion.div
-              className="text-green-600 font-medium mt-2"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-            >
-              🎉 Great Job! Strong performance.
-            </motion.div>
-          )}
-        </motion.div>
+          {/* Transcript */}
+          <div className="mt-6 bg-white border rounded-lg p-4">
+            <h4 className="font-semibold text-gray-700 mb-3">Detailed transcript & improvements</h4>
+            <div className="divide-y">
+              {report.transcript && report.transcript.length > 0 ? (
+                report.transcript.map((t, i) => (
+                  <div className="py-4" key={i}>
+                    <div className="text-xs text-gray-500">Question {i + 1}</div>
+                    <div className="text-sm font-medium text-gray-900 mt-1 mb-2">{t.question}</div>
 
-        {/* Strengths + Weaknesses */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          {/* Strengths */}
-          <div className="bg-green-50 p-6 rounded-2xl border border-green-100">
-            <h3 className="font-bold text-green-800 mb-4 flex items-center gap-2">
-              <FaCheckCircle /> Strengths
-            </h3>
+                    <div className="grid md:grid-cols-2 gap-4">
+                      <div className="bg-red-50 p-3 rounded-md border border-red-100">
+                        <div className="text-xs font-bold text-red-700 mb-2">Your answer</div>
+                        <div className="text-sm text-gray-800 whitespace-pre-wrap">{t.user_answer || "(No answer)"}</div>
+                        <div className="text-xs text-red-600 mt-2 italics">Feedback: {t.feedback || "—"}</div>
+                      </div>
 
-            <ul className="space-y-2">
-              {report.history?.flatMap(h => h.evaluation.strengths || []).length > 0
-                ? report.history.flatMap((h, i) =>
-                    (h.evaluation.strengths || []).map((s, idx) => (
-                      <li
-                        key={`${i}-${idx}`}
-                        className="flex items-start text-green-700 text-sm gap-2"
-                      >
-                        <span className="mt-1">•</span> {s}
-                      </li>
-                    ))
-                  )
-                : <p className="text-green-700 text-sm">No strengths detected</p>}
-            </ul>
-          </div>
-
-          {/* Weaknesses */}
-          <div className="bg-red-50 p-6 rounded-2xl border border-red-100">
-            <h3 className="font-bold text-red-800 mb-4 flex items-center gap-2">
-              <FaExclamationTriangle /> Areas to Improve
-            </h3>
-
-            <ul className="space-y-2">
-              {report.history?.flatMap(h => h.evaluation.weaknesses || []).length > 0
-                ? report.history.flatMap((h, i) =>
-                    (h.evaluation.weaknesses || []).map((w, idx) => (
-                      <li
-                        key={`${i}-${idx}`}
-                        className="flex items-start text-red-700 text-sm gap-2"
-                      >
-                        <span className="mt-1">•</span> {w}
-                      </li>
-                    ))
-                  )
-                : <p className="text-red-700 text-sm">No major weaknesses.</p>}
-            </ul>
-          </div>
-        </div>
-
-        {/* Transcript */}
-        <div className="bg-white rounded-3xl shadow-sm border overflow-hidden">
-          <div className="p-6 border-b bg-gray-50">
-            <h3 className="font-bold text-gray-800 text-lg">📝 Detailed Transcript</h3>
-            <p className="text-sm text-gray-500">
-              Review your answers with suggested improvements.
-            </p>
-          </div>
-
-          <div className="divide-y">
-            {transcript.map((item, idx) => (
-              <div key={idx} className="p-6 hover:bg-gray-50 transition">
-                <div className="mb-4">
-                  <span className="text-xs font-bold text-indigo-500 uppercase">
-                    Question {idx + 1}
-                  </span>
-                  <h4 className="text-lg font-medium text-gray-900 mt-1">
-                    {item.question}
-                  </h4>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  {/* User Answer */}
-                  <div className="bg-red-50 p-4 rounded-xl border border-red-100">
-                    <h5 className="text-sm font-bold text-red-800 mb-2 flex items-center gap-2">
-                      <FaExclamationTriangle /> Your Answer
-                    </h5>
-                    <p className="text-gray-700 text-sm whitespace-pre-wrap">
-                      {item.answer || "(No answer provided)"}
-                    </p>
-                    <div className="mt-3 pt-3 border-t border-red-200">
-                      <p className="text-xs text-red-700 italic">
-                        Feedback: {item.feedback}
-                      </p>
+                      <div className="bg-green-50 p-3 rounded-md border border-green-100">
+                        <div className="text-xs font-bold text-green-800 mb-2">AI suggested</div>
+                        <div className="text-sm text-gray-800 whitespace-pre-wrap">{t.improved_answer || "(No suggestion)"}</div>
+                        <div className="text-right mt-3">
+                          <button
+                            onClick={() => {
+                              navigator.clipboard.writeText(t.improved_answer || "");
+                              // small UX: flash
+                              setCopied(true);
+                              setTimeout(() => setCopied(false), 1400);
+                            }}
+                            className="text-xs font-medium text-green-700 hover:underline"
+                          >
+                            Copy suggestion
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
-
-                  {/* Improved Answer */}
-                  <div className="bg-green-50 p-4 rounded-xl border border-green-100">
-                    <h5 className="text-sm font-bold text-green-800 mb-2 flex items-center gap-2">
-                      <FaCheckCircle /> Improved Answer
-                    </h5>
-
-                    <p className="text-gray-800 text-sm whitespace-pre-wrap">
-                      {item.improvement}
-                    </p>
-
-                    <div className="mt-3 text-right">
-                      <button
-                        onClick={() => {
-                          navigator.clipboard.writeText(item.improvement);
-                          toast.success("Copied!");
-                        }}
-                        className="text-xs text-green-700 font-bold hover:underline flex items-center gap-1"
-                      >
-                        <FaCopy size={12} /> Copy
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
+                ))
+              ) : (
+                <div className="p-4 text-sm text-gray-500">Transcript not available.</div>
+              )}
+            </div>
           </div>
         </div>
-
       </div>
     </div>
   );
+}
+
+MockResult.propTypes = {
+  report: PropTypes.object,
+  onRestart: PropTypes.func
+};
+
+/* Helper: generate a short plain-text summary for clipboard */
+function generateSummary(report = {}) {
+  const score = report.overall_score ?? "N/A";
+  const dims = report.dimensions ? Object.entries(report.dimensions).map(([k, v]) => `${k}:${v}%`).join(", ") : "";
+  const strengths = report.feedback?.strengths?.slice(0, 3).join("; ") || "";
+  const quick = report.feedback?.quick_wins?.slice(0, 3).map(q => (q.title ? `${q.title} — ${q.description || ""}` : q)).join("; ") || "";
+  return `Score: ${score}\nDimensions: ${dims}\nStrengths: ${strengths}\nQuickWins: ${quick}`;
 }

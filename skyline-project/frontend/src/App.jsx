@@ -18,6 +18,8 @@ import AtsResult from './pages/AtsResult'; // NEW: results dashboard
 import Profile from './pages/Profile';
 import AiPage from './pages/AiPage';
 
+import ErrorBoundary from "./components/ErrorBoundary";
+
 function App() {
   return (
     <div className="bg-gray-50 min-h-screen flex flex-col font-sans text-gray-900">
@@ -29,6 +31,7 @@ function App() {
       {/* 2. Main Content Area */}
       <div className="flex-grow flex flex-col">
         <main className="w-full mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 flex-grow">
+          <ErrorBoundary>
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/jobs" element={<JobAggregator />} />
@@ -39,6 +42,7 @@ function App() {
             <Route path="/ai" element={<AiPage />} />
             <Route path="/profile" element={<Profile />} />
           </Routes>
+          </ErrorBoundary>
         </main>
         
         <Footer />

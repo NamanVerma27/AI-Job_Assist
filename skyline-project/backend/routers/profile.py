@@ -203,37 +203,76 @@ def update_profile(profile: dict, db: Session = Depends(get_db)):
 # -------------------------
 # Resume Management
 # -------------------------
-@router.get("/resumes")
-def get_resumes(db: Session = Depends(get_db)):
-    """
-    Return list of resumes for the demo user.
-    If schemas.ResumeMetadata exists, attempt to return that shape; otherwise return plain list of dicts.
-    """
-    user = get_current_user(db)
-    resumes = db.query(models.Resume).filter(models.Resume.user_id == user.id).order_by(models.Resume.upload_date.desc()).all()
 
-    if SCHEMAS_AVAILABLE:
+# Define get_resumes differently depending on whether schemas are available.
+# This guarantees the OpenAPI spec shows a list response when schemas are installed,
+# and ensures the runtime always returns a Python list (never a single object).
+if SCHEMAS_AVAILABLE:
+    @router.get("/resumes", response_model=List[schemas.ResumeMetadata])
+    def get_resumes(db: Session = Depends(get_db)):
+        """
+        Return list of resumes for the demo user.
+        Always returns a list (possibly empty). When schemas are available,
+        FastAPI will validate the list elements against ResumeMetadata.
+        """
+        user = get_current_user(db)
+        resumes = db.query(models.Resume).filter(models.Resume.user_id == user.id).order_by(models.Resume.upload_date.desc()).all()
+
+        # Defensive: ensure resumes is a list
+        if resumes is None:
+            return []
+
+        out = []
         try:
-            out = []
             for r in resumes:
-                out.append(schemas.ResumeMetadata(id=r.id, filename=r.filename, upload_date=r.upload_date, parsing_status=r.parsing_status, primary_flag=r.primary_flag))
+                out.append(schemas.ResumeMetadata(
+                    id=r.id,
+                    filename=r.filename,
+                    upload_date=r.upload_date,
+                    parsing_status=r.parsing_status,
+                    primary_flag=r.primary_flag
+                ))
+            # Guarantee list return
             return out
         except Exception:
+            # If schema conversion fails, fall back to dict list
             traceback.print_exc()
+            fallback = []
+            for r in resumes:
+                fallback.append({
+                    "id": r.id,
+                    "filename": r.filename,
+                    "filepath": r.filepath,
+                    "upload_date": r.upload_date,
+                    "parsing_status": r.parsing_status,
+                    "primary_flag": r.primary_flag,
+                    "note": r.note
+                })
+            return fallback
+else:
+    @router.get("/resumes")
+    def get_resumes(db: Session = Depends(get_db)):
+        """
+        Return list of resumes (plain dicts). Always returns a list (possibly empty).
+        """
+        user = get_current_user(db)
+        resumes = db.query(models.Resume).filter(models.Resume.user_id == user.id).order_by(models.Resume.upload_date.desc()).all()
 
-    # Fallback plain dict list
-    return [
-        {
-            "id": r.id,
-            "filename": r.filename,
-            "filepath": r.filepath,
-            "upload_date": r.upload_date,
-            "parsing_status": r.parsing_status,
-            "primary_flag": r.primary_flag,
-            "note": r.note
-        }
-        for r in resumes
-    ]
+        if not resumes:
+            return []
+
+        return [
+            {
+                "id": r.id,
+                "filename": r.filename,
+                "filepath": r.filepath,
+                "upload_date": r.upload_date,
+                "parsing_status": r.parsing_status,
+                "primary_flag": r.primary_flag,
+                "note": r.note
+            }
+            for r in resumes
+        ]
 
 
 @router.post("/resumes")
