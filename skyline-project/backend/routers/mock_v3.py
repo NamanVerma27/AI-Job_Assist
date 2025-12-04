@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 from uuid import uuid4
 import logging
 import re
@@ -19,7 +19,7 @@ class StartReq(BaseModel):
     role: Optional[str] = "general"
     difficulty: Optional[str] = "Medium"
     question_count: Optional[int] = 5
-    # NEW FIELDS
+    # Configs
     interview_type: Optional[str] = "Mixed"
     personality: Optional[str] = "Professional"
 
@@ -32,8 +32,8 @@ class SubmitReq(BaseModel):
 def _get_session(db, sid):
     return db.query(MockSession).filter(MockSession.session_id == sid).first()
 
-def _create_interaction(db, session, q_text):
-    inter = MockInteraction(session_id_fk=session.id, question=q_text)
+def _create_interaction(db, session, q_text, a_text=None):
+    inter = MockInteraction(session_id_fk=session.id, question=q_text, answer=a_text)
     db.add(inter)
     db.commit()
     db.refresh(inter)
@@ -48,7 +48,6 @@ def start_session(payload: StartReq, db: Session = Depends(get_db)):
         role=payload.role, 
         difficulty=payload.difficulty,
         total_questions=payload.question_count,
-        # Save New Configs
         interview_type=payload.interview_type,
         personality=payload.personality,
         current_q=0, 
@@ -57,14 +56,13 @@ def start_session(payload: StartReq, db: Session = Depends(get_db)):
     db.add(session)
     db.commit()
     
-    # Pass Config to AI
+    # 1. Ask First Question
     q = llm_router.ask_question(
         role=payload.role, 
         difficulty=payload.difficulty,
         type_=payload.interview_type,
         personality=payload.personality
     )
-    
     _create_interaction(db, session, q["text"])
     session.current_q = 1
     db.commit()
@@ -78,43 +76,47 @@ def submit_answer(req: SubmitReq, db: Session = Depends(get_db)):
 
     # 1. Save Answer
     last_inter = db.query(MockInteraction).filter(MockInteraction.session_id_fk == session.id).order_by(MockInteraction.created_at.desc()).first()
-    if last_inter:
-        last_inter.answer = req.answer
-        db.commit()
+    if not last_inter: last_inter = _create_interaction(db, session, "Placeholder")
+    
+    inter = last_inter
+    inter.answer = req.answer
+    db.commit()
 
-    # 2. Evaluate (Pass Config)
+    # 2. Evaluate (PASS QUESTION CONTEXT)
     ev_res = llm_router.evaluate_answer(
-        req.answer, 
+        answer=req.answer, 
+        question=inter.question, # <--- Passing question text here ensures relevance check
         role=session.role, 
         type_=session.interview_type,
         personality=session.personality
     )
     evaluation = ev_res.get("evaluation", {})
+    provider = ev_res.get("provider", "none")
     
+    # 3. Save Results
     try:
-        # Save rich feedback
+        # Format rich feedback for UI
         raw_fb = evaluation.get("feedback", "")
         fb_text = " ".join([str(x) for x in raw_fb]) if isinstance(raw_fb, list) else str(raw_fb)
         score = evaluation.get("score", 0)
         
-        # Format string for frontend parser
         rich_feedback = f"Score: {score}\n\nFeedback:\n{fb_text}\n\n"
         if evaluation.get("strengths"):
             rich_feedback += "Strengths:\n" + "\n".join([f"- {s}" for s in evaluation["strengths"]]) + "\n\n"
         if evaluation.get("weaknesses"):
             rich_feedback += "Weaknesses:\n" + "\n".join([f"- {w}" for w in evaluation["weaknesses"]])
             
-        last_inter.feedback = rich_feedback.strip()
+        inter.feedback = rich_feedback.strip()
         
         raw_rw = evaluation.get("suggested_rewrite") or evaluation.get("improved_answer") or ""
-        last_inter.improved_answer = " ".join([str(x) for x in raw_rw]) if isinstance(raw_rw, list) else str(raw_rw)
+        inter.improved_answer = " ".join([str(x) for x in raw_rw]) if isinstance(raw_rw, list) else str(raw_rw)
         
         db.commit()
     except Exception as e:
         logger.error(f"Feedback save error: {e}")
         db.rollback()
 
-    # 3. Next Question (Pass Config)
+    # 4. Check Next
     next_question_data = None
     if session.current_q < session.total_questions:
         q = llm_router.ask_question(
@@ -137,11 +139,11 @@ def submit_answer(req: SubmitReq, db: Session = Depends(get_db)):
         "data": {
             "evaluation": evaluation,
             "next_question": next_question_data, 
-            "is_finished": session.finished
+            "is_finished": session.finished,
+            "provider": provider
         }
     }
 
-# ... (Keep end_session and get_results as is) ...
 @router.post("/{session_id}/end")
 def end_session(session_id: str, db: Session = Depends(get_db)):
     session = _get_session(db, session_id)

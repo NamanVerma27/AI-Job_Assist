@@ -1,61 +1,78 @@
-// src/components/mock/AnswerBar.jsx
-import React, { useState, useRef, useEffect } from "react";
-import { FaMicrophone, FaPaperPlane } from "react-icons/fa";
+import React, { useState } from 'react';
+import { FaPaperPlane, FaMicrophone, FaCode } from 'react-icons/fa';
 
-/**
- * AnswerBar
- * Props:
- *  - onSubmit(text)
- */
-export default function AnswerBar({ onSubmit, placeholder = "Type your answer..." }) {
-  const [text, setText] = useState("");
-  const inputRef = useRef(null);
+function AnswerBar({ onSubmit, isLoading, onToggleCode, isCodeOpen }) {
+  const [text, setText] = useState('');
 
-  useEffect(() => {
-    const handler = (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        if (text.trim()) {
-          handleSend();
-        }
-      }
-    };
-    const el = inputRef.current;
-    if (el) el.addEventListener("keydown", handler);
-    return () => {
-      if (el) el.removeEventListener("keydown", handler);
-    };
-  }, [text]);
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!text.trim() && !isCodeOpen) return;
+    onSubmit(text);
+    setText('');
+  };
 
-  const handleSend = () => {
-    if (!text.trim()) return;
-    onSubmit(text.trim());
-    setText("");
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit(e);
+    }
   };
 
   return (
-    <div className="fixed bottom-6 left-0 right-0 flex justify-center pointer-events-auto">
-      <div className="max-w-4xl w-full px-6">
-        <div className="bg-white border rounded-3xl p-3 flex items-center gap-3 shadow-lg">
-          <button aria-label="Record (coming soon)" className="text-gray-400 hover:text-gray-600 p-2" title="Record (coming soon)">
-            <FaMicrophone />
-          </button>
+    <div className="bg-white border-t border-gray-200 p-4 shadow-sm z-20">
+      <form 
+        onSubmit={handleSubmit}
+        className="max-w-6xl mx-auto relative flex gap-3 items-end"
+      >
+        {/* Code Toggle Button */}
+        <button
+          type="button"
+          onClick={onToggleCode}
+          className={`p-3 rounded-xl border transition-all ${
+            isCodeOpen 
+              ? "bg-indigo-100 text-indigo-600 border-indigo-200" 
+              : "bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-100"
+          }`}
+          title="Toggle Code Editor"
+        >
+          <FaCode size={18} />
+        </button>
 
+        {/* Text Input */}
+        <div className="flex-grow relative">
           <textarea
-            ref={inputRef}
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder={placeholder}
-            rows={2}
-            className="flex-1 resize-none px-4 py-3 rounded-xl border focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            aria-label="Answer input"
+            onKeyDown={handleKeyDown}
+            placeholder="Type your answer here... (Shift+Enter for new line)"
+            className="w-full bg-gray-50 border border-gray-200 text-gray-800 rounded-xl px-4 py-3 pr-12 focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all outline-none resize-none shadow-inner"
+            rows={1}
+            style={{ minHeight: '50px', maxHeight: '150px' }}
           />
-
-          <button onClick={handleSend} aria-label="Submit answer" className="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-3 rounded-xl flex items-center gap-3">
-            <FaPaperPlane /> <span className="hidden md:inline">Send</span>
+          <button 
+            type="button"
+            className="absolute right-3 top-3 text-gray-400 hover:text-indigo-500 transition"
+            title="Voice Input (Coming Soon)"
+          >
+            <FaMicrophone />
           </button>
         </div>
-      </div>
+
+        {/* Submit Button */}
+        <button
+          type="submit"
+          disabled={isLoading || (!text.trim() && !isCodeOpen)}
+          className="bg-indigo-600 text-white p-3 rounded-xl hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-md transition-transform active:scale-95 flex-shrink-0"
+        >
+          {isLoading ? (
+            <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+          ) : (
+            <FaPaperPlane size={18} />
+          )}
+        </button>
+      </form>
     </div>
   );
 }
+
+export default AnswerBar;
