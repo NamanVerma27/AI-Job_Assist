@@ -1,190 +1,276 @@
-// src/components/mock/MockResult.jsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import PropTypes from "prop-types";
-import { FaClipboard, FaRedo } from "react-icons/fa";
+import { 
+  FaClipboard, FaRedo, FaCheckCircle, FaLightbulb, 
+  FaQuoteLeft, FaMagic, FaChartPie, FaArrowRight 
+} from "react-icons/fa";
+import { motion } from "framer-motion";
+import AdvancedGauge from "../AdvancedGauge"; // Your requested integration
 import "./mock_result.css";
 
-/**
- * MockResult
- * Props:
- *  - report: {
- *      overall_score: number (0-100) | null,
- *      dimensions: { clarity: 80, impact: 60, ... },
- *      feedback: { quick_wins: [], strengths: [], weaknesses: [] },
- *      transcript: [{ question, user_answer, improved_answer, feedback }]
- *    }
- *  - onRestart(): callback to restart a session
- */
+// --- Helpers ---
+function parseRichFeedback(text) {
+  if (!text) return { feedback: "No feedback available." };
+  const result = { score: null, feedback: "", strengths: [], weaknesses: [] };
+
+  const scoreMatch = text.match(/Score:\s*(\d+)/i);
+  if (scoreMatch) result.score = parseInt(scoreMatch[1]);
+
+  const feedbackMatch = text.match(/Feedback:\s*([\s\S]*?)(?=(Strengths:|Weaknesses:|$))/i);
+  if (feedbackMatch) result.feedback = feedbackMatch[1].trim();
+  else result.feedback = text;
+
+  const strengthsMatch = text.match(/Strengths:\s*([\s\S]*?)(?=(Weaknesses:|$))/i);
+  if (strengthsMatch) {
+    result.strengths = strengthsMatch[1].split(/\n|-/).map(s => s.trim()).filter(s => s.length > 2);
+  }
+
+  const weaknessesMatch = text.match(/Weaknesses:\s*([\s\S]*?)(?=$)/i);
+  if (weaknessesMatch) {
+    result.weaknesses = weaknessesMatch[1].split(/\n|-/).map(s => s.trim()).filter(s => s.length > 2);
+  }
+  return result;
+}
+
 export default function MockResult({ report = {}, onRestart = () => {} }) {
-  const score = report.overall_score ?? null;
-  const celebrate = score !== null && score >= 75;
-  const confettiRef = useRef(null);
+  const overallScore = report.overall_score ?? 0;
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    if (celebrate) {
-      // trigger CSS confetti burst by adding a class briefly
-      const el = confettiRef.current;
-      if (!el) return;
-      el.classList.remove("confetti-burst");
-      // allow reflow
-      // eslint-disable-next-line no-unused-expressions
-      el.offsetWidth;
-      el.classList.add("confetti-burst");
-    }
-  }, [celebrate, score]);
-
-  const copySummary = async () => {
-    const text = generateSummary(report);
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
-    } catch {
-      setCopied(false);
-    }
-  };
+  // Trigger confetti logic inside AdvancedGauge or here if needed, 
+  // but AdvancedGauge usually handles visuals. 
 
   return (
-    <div className="max-w-6xl mx-auto p-6">
-      <div className="bg-white rounded-2xl shadow-sm p-6 grid md:grid-cols-3 gap-6 items-center">
-        {/* SCORE CARD */}
-        <div className="flex flex-col items-center justify-center gap-4">
-          <div className="relative">
-            <svg className="w-40 h-40" viewBox="0 0 120 120" aria-hidden>
-              <defs>
-                <linearGradient id="grad" x1="0" x2="1">
-                  <stop offset="0%" stopColor="#4F46E5" />
-                  <stop offset="100%" stopColor="#06b6d4" />
-                </linearGradient>
-              </defs>
-              <circle cx="60" cy="60" r="48" stroke="#EEF2FF" strokeWidth="18" fill="none" />
-              <circle
-                cx="60"
-                cy="60"
-                r="48"
-                stroke="url(#grad)"
-                strokeWidth="18"
-                strokeLinecap="round"
-                fill="none"
-                strokeDasharray={`${score ?? 0} ${100 - (score ?? 0)}`}
-                transform="rotate(-90 60 60)"
-              />
-            </svg>
+    <div className="max-w-7xl mx-auto space-y-12 pb-20 animate-fade-in-up font-sans text-gray-800">
+      
+      {/* --- HERO SECTION: Score & Actions --- */}
+      <div className="relative overflow-hidden rounded-3xl bg-white shadow-xl ring-1 ring-gray-100 p-8 md:p-12">
+        {/* Decorative Background Blurs */}
+        <div className="absolute top-0 right-0 -mt-20 -mr-20 w-96 h-96 bg-indigo-50 rounded-full blur-3xl opacity-60 pointer-events-none"></div>
+        <div className="absolute bottom-0 left-0 -mb-20 -ml-20 w-80 h-80 bg-blue-50 rounded-full blur-3xl opacity-60 pointer-events-none"></div>
 
-            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-              <div className={`text-4xl font-extrabold ${score >= 60 ? "text-indigo-900" : "text-gray-800"}`}>
-                {score === null ? "—" : `${score}`}
+        <div className="relative z-10 grid lg:grid-cols-2 gap-12 items-center">
+          
+          {/* Left: Text & Actions */}
+          <div className="space-y-6">
+            <div>
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-100 text-indigo-700 text-xs font-bold uppercase tracking-wider mb-4">
+                <FaMagic className="text-indigo-500" /> AI Analysis Complete
               </div>
-              <div className="text-sm text-gray-500 mt-1">Overall Score</div>
+              <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight text-gray-900 leading-tight">
+                Your Interview <br />
+                <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-blue-500">
+                  Performance Report
+                </span>
+              </h1>
+              <p className="text-lg text-gray-500 mt-4 leading-relaxed max-w-lg">
+                We've analyzed your responses against industry standards. 
+                Review the detailed breakdown to identify your strengths and gaps.
+              </p>
             </div>
 
-            {/* confetti container */}
-            <div ref={confettiRef} className="confetti-container pointer-events-none" aria-hidden />
+            <div className="flex flex-wrap gap-4 pt-2">
+              <button 
+                onClick={onRestart}
+                className="px-8 py-4 bg-gray-900 text-white rounded-xl font-bold shadow-lg shadow-gray-200 hover:bg-black hover:scale-[1.02] transition-all flex items-center gap-3"
+              >
+                <FaRedo /> Start New Session
+              </button>
+              <button 
+                onClick={() => {
+                  navigator.clipboard.writeText(`Scored ${overallScore}/100 on Skyline AI Mock Interview!`);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                }}
+                className="px-8 py-4 bg-white border border-gray-200 text-gray-700 rounded-xl font-bold hover:bg-gray-50 hover:border-gray-300 transition-all flex items-center gap-3"
+              >
+                <FaClipboard /> {copied ? "Copied!" : "Share Result"}
+              </button>
+            </div>
           </div>
 
-          <div className="flex gap-2">
-            <button
-              onClick={copySummary}
-              className="bg-indigo-600 text-white px-4 py-2 rounded-md flex items-center gap-2 hover:bg-indigo-700"
-              aria-label="Copy summary"
-            >
-              <FaClipboard /> <span className="hidden sm:inline">{copied ? "Copied" : "Copy summary"}</span>
-            </button>
+          {/* Right: The Gauge */}
+          <div className="flex justify-center lg:justify-end">
+            <div className="relative bg-white/50 backdrop-blur-sm p-8 rounded-full shadow-sm border border-white/60">
+               <AdvancedGauge score={overallScore} size={280} thickness={20} />
+            </div>
+          </div>
+        </div>
+      </div>
 
-            <button
-              onClick={onRestart}
-              className="bg-white border border-gray-200 px-4 py-2 rounded-md flex items-center gap-2 hover:bg-gray-50"
-            >
-              <FaRedo /> Restart
-            </button>
+      {/* --- METRICS GRID --- */}
+      <div className="grid md:grid-cols-12 gap-6">
+        
+        {/* Dimensions Column (4 cols) */}
+        <div className="md:col-span-4 bg-white rounded-2xl p-6 shadow-sm border border-gray-100 flex flex-col h-full">
+          <div className="flex items-center gap-2 mb-6 pb-4 border-b border-gray-50">
+            <div className="p-2 bg-blue-50 rounded-lg text-blue-600"><FaChartPie /></div>
+            <h3 className="font-bold text-gray-900 text-lg">Key Dimensions</h3>
+          </div>
+          
+          <div className="space-y-6 flex-grow">
+            {report.dimensions && Object.entries(report.dimensions).map(([key, val]) => (
+              <div key={key}>
+                <div className="flex justify-between text-sm font-medium mb-2">
+                  <span className="capitalize text-gray-600">{key}</span>
+                  <span className={`font-bold ${val >= 70 ? "text-gray-900" : "text-indigo-600"}`}>{val}%</span>
+                </div>
+                <div className="h-2 w-full bg-gray-100 rounded-full overflow-hidden">
+                  <motion.div 
+                    initial={{ width: 0 }}
+                    animate={{ width: `${val}%` }}
+                    transition={{ duration: 1, delay: 0.2 }}
+                    className={`h-full rounded-full ${val >= 80 ? "bg-green-500" : val >= 50 ? "bg-indigo-500" : "bg-orange-400"}`} 
+                  />
+                </div>
+              </div>
+            ))}
+            {(!report.dimensions || Object.keys(report.dimensions).length === 0) && (
+              <p className="text-gray-400 text-sm italic">Not enough data to generate dimensions.</p>
+            )}
           </div>
         </div>
 
-        {/* PERFORMANCE BREAKDOWN */}
-        <div className="md:col-span-2">
-          <h3 className="text-lg font-semibold text-gray-800 mb-4">Performance breakdown</h3>
-          <div className="grid md:grid-cols-2 gap-4">
-            <div className="bg-gray-50 p-4 rounded-lg">
-              <h4 className="text-sm font-medium text-gray-600 mb-3">Key dimensions</h4>
-              <div className="space-y-3">
-                {report.dimensions && Object.keys(report.dimensions).length > 0 ? (
-                  Object.entries(report.dimensions).map(([k, v]) => (
-                    <div key={k}>
-                      <div className="flex justify-between text-xs font-medium text-gray-700 mb-1">
-                        <span className="capitalize">{k.replace(/_/g, " ")}</span>
-                        <span>{v}%</span>
-                      </div>
-                      <div className="w-full bg-white rounded-full h-2.5">
-                        <div className="bg-indigo-600 h-2.5 rounded-full" style={{ width: `${v}%` }} />
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="text-sm text-gray-500">No dimension data available.</div>
-                )}
-              </div>
-            </div>
-
-            <div className="bg-white p-4 rounded-lg border">
-              <h4 className="text-sm font-medium text-gray-600 mb-3">Quick wins</h4>
-              {report.feedback && report.feedback.quick_wins && report.feedback.quick_wins.length > 0 ? (
-                <ul className="space-y-2">
-                  {report.feedback.quick_wins.map((w, i) => (
-                    <li key={i} className="text-sm bg-indigo-50 p-2 rounded-md">
-                      <strong className="text-indigo-800">{w.title || "Tip"}</strong>
-                      <div className="text-xs text-indigo-700">{w.description || w}</div>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <div className="text-sm text-gray-500">No quick wins found.</div>
-              )}
-            </div>
-          </div>
-
-          {/* Transcript */}
-          <div className="mt-6 bg-white border rounded-lg p-4">
-            <h4 className="font-semibold text-gray-700 mb-3">Detailed transcript & improvements</h4>
-            <div className="divide-y">
-              {report.transcript && report.transcript.length > 0 ? (
-                report.transcript.map((t, i) => (
-                  <div className="py-4" key={i}>
-                    <div className="text-xs text-gray-500">Question {i + 1}</div>
-                    <div className="text-sm font-medium text-gray-900 mt-1 mb-2">{t.question}</div>
-
-                    <div className="grid md:grid-cols-2 gap-4">
-                      <div className="bg-red-50 p-3 rounded-md border border-red-100">
-                        <div className="text-xs font-bold text-red-700 mb-2">Your answer</div>
-                        <div className="text-sm text-gray-800 whitespace-pre-wrap">{t.user_answer || "(No answer)"}</div>
-                        <div className="text-xs text-red-600 mt-2 italics">Feedback: {t.feedback || "—"}</div>
-                      </div>
-
-                      <div className="bg-green-50 p-3 rounded-md border border-green-100">
-                        <div className="text-xs font-bold text-green-800 mb-2">AI suggested</div>
-                        <div className="text-sm text-gray-800 whitespace-pre-wrap">{t.improved_answer || "(No suggestion)"}</div>
-                        <div className="text-right mt-3">
-                          <button
-                            onClick={() => {
-                              navigator.clipboard.writeText(t.improved_answer || "");
-                              // small UX: flash
-                              setCopied(true);
-                              setTimeout(() => setCopied(false), 1400);
-                            }}
-                            className="text-xs font-medium text-green-700 hover:underline"
-                          >
-                            Copy suggestion
-                          </button>
-                        </div>
-                      </div>
+        {/* Quick Wins Column (8 cols) */}
+        <div className="md:col-span-8 bg-gradient-to-br from-indigo-900 to-blue-900 rounded-2xl p-8 shadow-lg text-white relative overflow-hidden">
+          <div className="absolute top-0 right-0 w-64 h-64 bg-white opacity-5 rounded-full blur-3xl -translate-y-10 translate-x-10 pointer-events-none"></div>
+          
+          <div className="relative z-10">
+            <h3 className="font-bold text-2xl mb-6 flex items-center gap-3">
+              <FaLightbulb className="text-yellow-300" /> Strategic Quick Wins
+            </h3>
+            
+            <div className="grid sm:grid-cols-2 gap-4">
+              {report.feedback?.quick_wins?.length > 0 ? (
+                report.feedback.quick_wins.map((win, i) => (
+                  <div key={i} className="bg-white/10 backdrop-blur-md border border-white/10 p-4 rounded-xl hover:bg-white/20 transition-all duration-300">
+                    <div className="flex gap-3 items-start">
+                      <div className="mt-1 w-2 h-2 rounded-full bg-blue-400 shrink-0 shadow-[0_0_8px_rgba(96,165,250,0.8)]"></div>
+                      <p className="text-sm md:text-base font-medium leading-relaxed text-blue-50">
+                        {typeof win === 'string' ? win : win.description || win.title}
+                      </p>
                     </div>
                   </div>
                 ))
               ) : (
-                <div className="p-4 text-sm text-gray-500">Transcript not available.</div>
+                <p className="text-white/60">No specific quick wins detected. Good job!</p>
               )}
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* --- DETAILED TRANSCRIPT (The Main Event) --- */}
+      <div className="space-y-6">
+        <div className="flex items-center gap-3 px-2">
+          <div className="h-8 w-1 bg-indigo-600 rounded-full"></div>
+          <h2 className="text-2xl font-bold text-gray-900">Detailed Transcript Analysis</h2>
+        </div>
+
+        <div className="grid gap-8">
+          {report.transcript?.map((item, i) => {
+            const analysis = parseRichFeedback(item.feedback);
+            const scoreColor = analysis.score >= 70 ? "bg-green-100 text-green-800 border-green-200" 
+                             : analysis.score >= 40 ? "bg-yellow-100 text-yellow-800 border-yellow-200" 
+                             : "bg-red-100 text-red-800 border-red-200";
+
+            return (
+              <motion.div 
+                key={i} 
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: "-100px" }}
+                className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden"
+              >
+                {/* Question Header */}
+                <div className="bg-gray-50/50 p-6 border-b border-gray-100 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="flex gap-4">
+                    <span className="flex-shrink-0 w-8 h-8 rounded-full bg-gray-200 text-gray-600 font-bold flex items-center justify-center text-sm">
+                      {i + 1}
+                    </span>
+                    <h4 className="text-lg font-bold text-gray-800 leading-snug">{item.question}</h4>
+                  </div>
+                  
+                  {analysis.score !== null && (
+                    <div className={`flex-shrink-0 px-4 py-1.5 rounded-full border text-sm font-bold shadow-sm ${scoreColor}`}>
+                      Score: {analysis.score}/100
+                    </div>
+                  )}
+                </div>
+
+                {/* Comparison Grid */}
+                <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
+                  
+                  {/* LEFT: Your Answer */}
+                  <div className="p-6 md:p-8 flex flex-col h-full bg-white">
+                    <h5 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                      <FaQuoteLeft /> Your Response
+                    </h5>
+                    
+                    <div className="flex-grow">
+                      <p className="text-gray-700 leading-relaxed text-base whitespace-pre-wrap">
+                        {item.user_answer || <span className="text-gray-400 italic">No answer provided.</span>}
+                      </p>
+                    </div>
+
+                    {/* Critique Block */}
+                    <div className="mt-8 bg-red-50/50 border border-red-100 rounded-xl p-5">
+                      <h6 className="text-xs font-bold text-red-800 uppercase tracking-wide mb-2">Critique</h6>
+                      <p className="text-sm text-red-700 mb-3 leading-relaxed">{analysis.feedback}</p>
+                      
+                      {analysis.weaknesses.length > 0 && (
+                        <ul className="space-y-1">
+                          {analysis.weaknesses.map((w, idx) => (
+                            <li key={idx} className="text-xs text-red-600 flex items-start gap-2">
+                              <span className="mt-0.5">•</span> {w}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* RIGHT: Improved Answer */}
+                  <div className="p-6 md:p-8 flex flex-col h-full bg-gradient-to-b from-indigo-50/30 to-white">
+                    <div className="flex justify-between items-center mb-4">
+                      <h5 className="text-xs font-bold text-indigo-600 uppercase tracking-wider flex items-center gap-2">
+                        <FaCheckCircle /> AI Suggested Answer
+                      </h5>
+                      <button 
+                        onClick={() => navigator.clipboard.writeText(item.improved_answer)}
+                        className="text-xs font-bold text-gray-400 hover:text-indigo-600 transition flex items-center gap-1"
+                        title="Copy text"
+                      >
+                        <FaClipboard /> Copy
+                      </button>
+                    </div>
+
+                    <div className="flex-grow">
+                      <div className="prose prose-sm prose-indigo text-gray-800 bg-white border border-indigo-100 rounded-xl p-5 shadow-sm">
+                        <p className="whitespace-pre-wrap leading-relaxed">
+                          {item.improved_answer || "No improvement suggested."}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Strengths Block */}
+                    {analysis.strengths.length > 0 && (
+                      <div className="mt-8 pt-4 border-t border-indigo-100">
+                        <span className="text-xs font-bold text-green-700 uppercase tracking-wide block mb-2">What you did well</span>
+                        <div className="flex flex-wrap gap-2">
+                          {analysis.strengths.map((s, idx) => (
+                            <span key={idx} className="px-3 py-1 bg-green-50 text-green-700 text-xs font-medium rounded-full border border-green-100">
+                              {s}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                </div>
+              </motion.div>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -195,12 +281,3 @@ MockResult.propTypes = {
   report: PropTypes.object,
   onRestart: PropTypes.func
 };
-
-/* Helper: generate a short plain-text summary for clipboard */
-function generateSummary(report = {}) {
-  const score = report.overall_score ?? "N/A";
-  const dims = report.dimensions ? Object.entries(report.dimensions).map(([k, v]) => `${k}:${v}%`).join(", ") : "";
-  const strengths = report.feedback?.strengths?.slice(0, 3).join("; ") || "";
-  const quick = report.feedback?.quick_wins?.slice(0, 3).map(q => (q.title ? `${q.title} — ${q.description || ""}` : q)).join("; ") || "";
-  return `Score: ${score}\nDimensions: ${dims}\nStrengths: ${strengths}\nQuickWins: ${quick}`;
-}
