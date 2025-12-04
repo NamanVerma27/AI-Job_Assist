@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from uuid import uuid4
 import logging
 import re
@@ -82,10 +82,10 @@ def submit_answer(req: SubmitReq, db: Session = Depends(get_db)):
     inter.answer = req.answer
     db.commit()
 
-    # 2. Evaluate (PASS QUESTION CONTEXT)
+    # 2. Evaluate
     ev_res = llm_router.evaluate_answer(
         answer=req.answer, 
-        question=inter.question, # <--- Passing question text here ensures relevance check
+        question=inter.question, 
         role=session.role, 
         type_=session.interview_type,
         personality=session.personality
@@ -95,7 +95,7 @@ def submit_answer(req: SubmitReq, db: Session = Depends(get_db)):
     
     # 3. Save Results
     try:
-        # Format rich feedback for UI
+        # Format rich feedback
         raw_fb = evaluation.get("feedback", "")
         fb_text = " ".join([str(x) for x in raw_fb]) if isinstance(raw_fb, list) else str(raw_fb)
         score = evaluation.get("score", 0)
@@ -192,3 +192,42 @@ def get_results(session_id: str, db: Session = Depends(get_db)):
             "transcript": transcript
         }
     }
+
+@router.get("/history/all")
+def get_history(db: Session = Depends(get_db)):
+    """
+    Returns a summary of all finished sessions for analytics.
+    """
+    sessions = db.query(MockSession).filter(MockSession.finished == True).order_by(MockSession.created_at.desc()).all()
+    
+    history = []
+    for s in sessions:
+        # Calculate Score on the fly to be robust
+        interactions = s.interactions
+        scores = []
+        for i in interactions:
+            if i.feedback:
+                m = re.search(r"Score[:\s]*([0-9]{1,3})", i.feedback)
+                if m: scores.append(int(m.group(1)))
+        
+        avg_score = int(sum(scores) / len(scores)) if scores else 0
+        
+        # Get Dimensions
+        dims = {}
+        if s.report_json:
+            try:
+                data = json.loads(s.report_json)
+                dims = data.get("dimensions", {})
+            except: pass
+
+        history.append({
+            "session_id": s.session_id,
+            "role": s.role,
+            "difficulty": s.difficulty,
+            "type": s.interview_type,
+            "date": s.created_at,
+            "score": avg_score,
+            "dimensions": dims
+        })
+        
+    return {"status": "success", "data": history}

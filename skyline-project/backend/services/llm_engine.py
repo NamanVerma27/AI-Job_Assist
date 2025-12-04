@@ -1,83 +1,214 @@
-# backend/services/llm_engine.py
-"""
-LLM Engine wrapper (Groq primary, Gemini fallback) with deterministic rewrite support.
-
-Features:
-- Deterministic synthesis for task_type == "rewrite_project" (no external calls).
-- LLM-first helpers used by MockEngineV3:
-  - generate_initial_question(...)
-  - generate_next_question(...)
-  - evaluate_answer(...)
-  - improve_answer(...)
-  - generate_full_report(...)
-
-Notes:
-- call_llm and JSON parsing are resilient; functions return {} or "" on parse failure
-  so callers can fall back to deterministic logic.
-- Replace/extend `MODEL_NAME` and any model selection logic as needed.
-"""
-
 import os
 import re
 import json
+import time
+import random
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from dotenv import load_dotenv
-
-# provider SDKs (optional)
-from openai import OpenAI  # used as Groq-compatible client in your code
+from openai import OpenAI
 import google.generativeai as genai
-
 from backend.config import get_settings
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-# Load .env
+# --- Configuration & Setup ---
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Model selections
-MODEL_NAME = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-GEMINI_MODEL = getattr(settings, "GEMINI_MODEL", "gemini-pro")
+# --- Runtime Configuration (tunable via env) ---
+CONFIG = {
+    "MAX_RETRIES": int(os.environ.get("LLM_MAX_RETRIES", 2)),
+    "BASE_TIMEOUT": int(os.environ.get("LLM_TIMEOUT", 15)),
+    "MAX_INPUT_TOKENS": int(os.environ.get("LLM_MAX_INPUT_TOKENS", 3500)),  # Approx chars
+    "DETERMINISTIC_WORD_LIMIT": int(os.environ.get("LLM_DETERMINISTIC_WORD_LIMIT", 35)),
+    "LOG_LEVEL": getattr(settings, "ENV", "production"),  # 'development' or 'production'
+    "GEMINI_MODEL": os.environ.get("GEMINI_MODEL", "gemini-pro"),
+}
 
-# Initialize Groq-like OpenAI client if API key present
+# Initialize Groq Client (if configured)
 client: Optional[OpenAI] = None
 _groq_api_key = os.environ.get("GROQ_API_KEY") or getattr(settings, "GROQ_API_KEY", None)
 if _groq_api_key:
     try:
-        client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=_groq_api_key)
-        logger.info("LLM Engine: Connected to Groq-compatible API.")
+        client = OpenAI(
+            base_url=os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+            api_key=_groq_api_key,
+            timeout=CONFIG["BASE_TIMEOUT"]
+        )
+        logger.info("✅ LLM Engine: Connected to Groq")
     except Exception as e:
-        logger.exception("Groq/OpenAI client init failed: %s", e)
-        client = None
+        logger.error("Groq Init Error: %s", str(e))
 
-# Configure genai (Gemini) if key present
+# Configure Gemini (genai) if key present
 _gemini_key = getattr(settings, "GEMINI_API_KEY", None)
 if _gemini_key:
     try:
         genai.configure(api_key=_gemini_key)
-        logger.info("LLM Engine: Gemini (genai) configured.")
     except Exception:
-        logger.exception("genai configure failed; continuing without it.")
+        logger.warning("Gemini configure failed.")
 
 
 class LLMEngine:
-    # ------------------------
-    # Deterministic helpers (existing behavior preserved)
-    # ------------------------
+    # ---------------------------------------------------------
+    # 1. INPUT SAFETY & PREPROCESSING
+    # ---------------------------------------------------------
     @staticmethod
-    def _enforce_word_limit(text: str, max_words: int = 35) -> str:
+    def _redact_pii(text: str) -> str:
+        """Conservative PII redaction (emails + common phone patterns)."""
+        if not text:
+            return ""
+        # Emails
+        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL]', text)
+        # Phone numbers (US/Intl common formats)
+        text = re.sub(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE]', text)
+        return text
+
+    @staticmethod
+    def _truncate_input(text: str, max_chars: Optional[int] = None) -> str:
+        """Hard truncate to prevent context overflow. Uses CONFIG limit by default."""
+        if text is None:
+            return ""
+        limit = max_chars if max_chars is not None else CONFIG["MAX_INPUT_TOKENS"]
+        if len(text) > limit:
+            logger.warning("Input truncated from %d to %d chars.", len(text), limit)
+            return text[:limit] + "...(truncated)"
+        return text
+
+    # ---------------------------------------------------------
+    # 2. OUTPUT CLEANING & SCHEMA VALIDATION
+    # ---------------------------------------------------------
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """Aggressive cleanup of LLM artifacts (remove fenced blocks, markdown, basic HTML)."""
+        if not text:
+            return ""
+
+        # Remove entire fenced blocks like ```json ... ``` (including language tag)
+        text = re.sub(r"```(?:[^\n]*\n)?[\s\S]*?```", "", text)
+
+        # Remove leftover fence markers if any
+        text = text.replace("```", "")
+
+        # Remove markdown bold/italic/backticks/quotes
+        text = text.replace("**", "").replace("*", "").replace("`", "")
+
+        # Remove simple HTML tags
+        text = re.sub(r"<[^>]*>", "", text)
+
+        # Normalize whitespace
+        text = re.sub(r"\r\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        return text.strip()
+
+    @staticmethod
+    def _validate_resume_schema(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Enforces schema for Resume Generation and returns a safe dict.
+        If parsing failed, returns defaults.
+        """
+        defaults = {
+            "resume_markdown": "# Resume\n\n(Content generation failed)",
+            "suggestions": []
+        }
+
+        if not isinstance(data, dict):
+            return defaults
+
+        # Validate resume_markdown
+        if "resume_markdown" not in data or not isinstance(data["resume_markdown"], str) or not data["resume_markdown"].strip():
+            data["resume_markdown"] = defaults["resume_markdown"]
+
+        # Validate suggestions
+        if "suggestions" not in data or not isinstance(data["suggestions"], list):
+            data["suggestions"] = []
+        else:
+            # Ensure list of strings
+            sanitized = []
+            for s in data["suggestions"]:
+                try:
+                    s_str = str(s).strip()
+                    if s_str:
+                        sanitized.append(s_str)
+                except Exception:
+                    continue
+            data["suggestions"] = sanitized
+
+        return data
+
+    @staticmethod
+    def _safe_parse_json(text: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        Multi-strategy JSON parser:
+         - Clean text
+         - Try direct json.loads
+         - Extract likely {...} blocks and try the largest one
+         - Attempt small repairs (trailing commas)
+        """
+        if not text:
+            return None
+
+        cleaned = LLMEngine._clean_text(text)
+
+        # Strategy A: direct parse
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy B: find all {...} blocks and attempt parse on the largest
+        candidates = []
+        for m in re.finditer(r"\{[\s\S]*?\}", cleaned):
+            candidates.append(m.group(0))
+
+        # sort candidates by length (largest first)
+        candidates.sort(key=lambda s: len(s), reverse=True)
+
+        for candidate in candidates:
+            # lightweight repairs: remove trailing commas before } or ]
+            cand = re.sub(r",\s*}", "}", candidate)
+            cand = re.sub(r",\s*]", "]", cand)
+            try:
+                return json.loads(cand)
+            except json.JSONDecodeError:
+                continue
+
+        # last resort: try substring from first { to last }
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start:end+1]
+            candidate = re.sub(r",\s*}", "}", candidate)
+            candidate = re.sub(r",\s*]", "]", candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("Failed to parse JSON from cleaned LLM output.")
+        return None
+
+    # ---------------------------------------------------------
+    # 3. DETERMINISTIC SYNTHESIS (V1 Logic Restored)
+    # ---------------------------------------------------------
+    @staticmethod
+    def _enforce_word_limit(text: str) -> str:
+        limit = CONFIG["DETERMINISTIC_WORD_LIMIT"]
         if not text:
             return ""
         parts = text.split()
-        return " ".join(parts[:max_words]) if len(parts) > max_words else text
+        if len(parts) > limit:
+            return " ".join(parts[:limit]).rstrip(".,;:") + "."
+        return text
 
     @staticmethod
     def _synthesize_from_input(user_input: str) -> str:
         """
-        Deterministic synthesis (used for task_type == 'rewrite_project').
+        Deterministic rewrite: verb mapping, pronoun removal, heuristics.
         """
         if not user_input or not user_input.strip():
             return "Built project."
@@ -88,9 +219,9 @@ class LLMEngine:
         verb_map = {
             "make": "Developed", "made": "Developed",
             "build": "Built", "built": "Built",
-            "create": "Developed", "created": "Developed",
+            "create": "Created", "created": "Created",
             "implement": "Implemented", "implemented": "Implemented",
-            "write": "Implemented", "wrote": "Implemented",
+            "write": "Authored", "wrote": "Authored",
             "fix": "Resolved", "fixed": "Resolved",
             "develop": "Developed", "developed": "Developed",
             "design": "Designed", "designed": "Designed",
@@ -98,326 +229,245 @@ class LLMEngine:
             "engineer": "Engineered", "engineered": "Engineered",
             "launch": "Launched", "launched": "Launched",
             "automate": "Automated", "automated": "Automated",
+            "use": "Utilized", "used": "Utilized"
         }
 
-        lc = re.sub(r'^\s*(i am|i\'m|i|we|we\'re|we are)\s+', '', lc, flags=re.IGNORECASE).strip()
+        # Remove pronouns
+        lc = re.sub(r'^\s*(i am|i\'m|i|we|we\'re|we are|he|she)\s+', '', lc, flags=re.IGNORECASE).strip()
 
+        # Verb detection
         m = re.match(r'^(?P<v>[a-z]+)\s+(?P<rest>.+)$', lc)
-        verb_word = None
+        chosen_verb = "Built"
         rest = lc
+
         if m:
             verb_word = m.group('v')
             rest = m.group('rest').strip()
+            if verb_word in verb_map:
+                chosen_verb = verb_map[verb_word]
+            else:
+                for k, v in verb_map.items():
+                    if re.search(r'\b' + re.escape(k) + r'\b', lc):
+                        chosen_verb = v
+                        break
 
-        chosen_verb = None
-        if verb_word and verb_word in verb_map:
-            chosen_verb = verb_map[verb_word]
-        else:
-            for k in verb_map.keys():
-                if re.search(r'\b' + re.escape(k) + r'\b', lc):
-                    chosen_verb = verb_map[k]
-                    break
-
-        if not chosen_verb:
-            chosen_verb = "Built"
-
+        # Article & grammar heuristics
         rest = re.sub(r'^\s*(a|an|the)\s+', '', rest, flags=re.IGNORECASE).strip()
+
         rest_words = rest.split()
         if len(rest_words) > 12:
             rest = " ".join(rest_words[:12])
 
         if rest:
             rest = rest[0].upper() + rest[1:] if rest[0].isalpha() else rest
-            if re.match(r'^[AEIOUaeiou]', rest):
+            if re.match(r'^[A-Z]{2,}\b', rest):
+                sentence = f"{chosen_verb} {rest}."
+            elif re.match(r'^[AEIOUaeiou]', rest):
                 sentence = f"{chosen_verb} an {rest}."
             else:
-                if re.match(r'^[A-Z]{2,}\b', rest):
-                    sentence = f"{chosen_verb} {rest}."
-                else:
-                    sentence = f"{chosen_verb} a {rest}."
+                sentence = f"{chosen_verb} a {rest}."
         else:
             sentence = f"{chosen_verb} project."
 
         sentence = re.sub(r'\s+', ' ', sentence).strip()
-        if not re.search(r'[\.!?]$', sentence):
-            sentence = sentence.rstrip('.') + '.'
+        sentence = sentence.replace("..", ".")
+        if not sentence.endswith("."):
+            sentence += "."
 
-        sentence = LLMEngine._enforce_word_limit(sentence, max_words=35)
-        if not re.search(r'[\.!?]$', sentence):
-            sentence = sentence.rstrip('.') + '.'
-        return sentence
+        return LLMEngine._enforce_word_limit(sentence)
 
-    # ------------------------
-    # Low-level LLM call (Groq -> Gemini)
-    # Returns raw text output (string). Does not parse JSON.
-    # ------------------------
+    # ---------------------------------------------------------
+    # 4. ROBUST NETWORK CALLER (Backoff + Jitter + Timeout for genai)
+    # ---------------------------------------------------------
     @staticmethod
-    def _call_llm(messages: list, max_tokens: int = 512, temperature: float = 0.1) -> str:
-        raw_text = ""
-        # Try Groq/OpenAI-compatible client first
+    def _genai_generate_with_timeout(full_prompt: str, timeout: int) -> Optional[Any]:
+        """
+        Execute genai model.generate_content with a timeout using ThreadPoolExecutor.
+        Returns the model response object or raises exception on failure/timeout.
+        """
+        model = genai.GenerativeModel(CONFIG["GEMINI_MODEL"])
+
+        def _call():
+            return model.generate_content(full_prompt)
+
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_call)
+            try:
+                return fut.result(timeout=timeout)
+            except FuturesTimeoutError:
+                fut.cancel()
+                raise TimeoutError("Genai call timed out")
+            except Exception:
+                fut.cancel()
+                raise
+
+    @staticmethod
+    def _call_llm(messages: List[Dict[str, str]], max_tokens: int = 512, temperature: float = 0.1) -> Optional[str]:
+        """
+        Executes LLM call with retries + exponential backoff + jitter.
+        Returns cleaned string content OR None if all attempts fail.
+        """
+        start_time = time.time()
+
+        # 1) Try Groq with retries
         if client:
-            try:
-                resp = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                raw_text = getattr(resp.choices[0].message, "content", "") or ""
-                logger.debug("Groq response length=%d", len(raw_text or ""))
-            except Exception as e:
-                logger.exception("Groq call failed: %s", e)
-                raw_text = ""
-
-        # Fallback to Gemini (genai)
-        if not raw_text and _gemini_key:
-            try:
-                # Use a simple concatenated prompt for genai
-                full_prompt = "\n".join([m["content"] for m in messages if m.get("role") in ("system", "user")])
-                model = genai.GenerativeModel(GEMINI_MODEL)
-                resp = model.generate_content(full_prompt)
-                raw_text = getattr(resp, "text", "") or str(resp)
-                logger.debug("Gemini response length=%d", len(raw_text or ""))
-            except Exception as e:
-                logger.exception("genai call failed: %s", e)
-                raw_text = ""
-
-        # Final safety: remove code fences and tidy whitespace
-        if raw_text:
-            cleaned = re.sub(r"```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
-            cleaned = cleaned.replace("`", "").replace("**", "").strip()
-            cleaned = re.sub(r"\r\n", "\n", cleaned)
-            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-            return cleaned.strip()
-
-        return ""
-
-    # ------------------------
-    # JSON helper: attempt to parse JSON from model text robustly
-    # ------------------------
-    @staticmethod
-    def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
-        if not text:
-            return None
-        # Try direct parse
-        try:
-            return json.loads(text)
-        except Exception:
-            # Extract the first {...} block
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = text[start:end+1]
+            attempt = 0
+            while attempt < CONFIG["MAX_RETRIES"]:
                 try:
-                    return json.loads(candidate)
-                except Exception:
-                    # attempt to fix common issues: single quotes -> double
-                    cand2 = candidate.replace("'", '"')
-                    try:
-                        return json.loads(cand2)
-                    except Exception:
-                        return None
-            return None
+                    resp = client.chat.completions.create(
+                        model=os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"),
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=CONFIG["BASE_TIMEOUT"]
+                    )
+                    content = getattr(resp.choices[0].message, "content", None)
+                    if content:
+                        if CONFIG["LOG_LEVEL"] == "development":
+                            logger.info("LLM Success (Groq) in %.2fs", time.time() - start_time)
+                        return LLMEngine._clean_text(content)
+                    # Treat empty content as an error to trigger retry
+                    raise ValueError("Empty response from Groq")
+                except Exception as e:
+                    attempt += 1
+                    # exponential backoff + jitter, clamp to 10s max
+                    delay = min((1.5 ** attempt) + (random.random() * 0.5), 10.0)
+                    logger.warning("Groq Attempt %d failed: %s. Retrying in %.2fs...", attempt, str(e), delay)
+                    time.sleep(delay)
 
-    # ------------------------
-    # Public API
-    # ------------------------
+        # 2) Try Gemini (single attempt) with timeout wrapper
+        if _gemini_key:
+            try:
+                # Build prompt from messages
+                full_prompt = ""
+                for m in messages:
+                    role_prefix = "System: " if m.get("role") == "system" else "User: "
+                    full_prompt += f"{role_prefix}{m.get('content', '')}\n\n"
+
+                # Execute with timeout wrapper
+                resp = LLMEngine._genai_generate_with_timeout(full_prompt, CONFIG["BASE_TIMEOUT"])
+                # genai response may have .text attribute
+                text_out = getattr(resp, "text", None) or (str(resp) if resp is not None else "")
+                if text_out:
+                    if CONFIG["LOG_LEVEL"] == "development":
+                        logger.info("LLM Success (Gemini) in %.2fs", time.time() - start_time)
+                    return LLMEngine._clean_text(text_out)
+            except TimeoutError as te:
+                logger.error("Gemini call timed out: %s", str(te))
+            except Exception as e:
+                exc_info = (CONFIG["LOG_LEVEL"] == "development")
+                logger.error("Gemini Fallback Failed: %s", str(e), exc_info=exc_info)
+
+        # All providers failed
+        logger.error("All LLM providers failed after %.2fs", time.time() - start_time)
+        return None
+
+    # ---------------------------------------------------------
+    # 5. PUBLIC API
+    # ---------------------------------------------------------
     @staticmethod
     def generate_response(prompt: str, task_type: str = "chat", role: str = "General") -> str:
-        """
-        General-purpose text response. If task_type == 'rewrite_project' use deterministic synthesis.
-        Otherwise call LLM and return cleaned text.
-        """
+        """General purpose text generator."""
+        # Input safety
+        safe_prompt = LLMEngine._truncate_input(LLMEngine._redact_pii(prompt))
+
+        # Deterministic path
         if task_type == "rewrite_project":
-            return LLMEngine._synthesize_from_input(prompt)
+            return LLMEngine._synthesize_from_input(safe_prompt)
 
-        # Build system/user messages based on task_type
-        if task_type == "mock_interview":
-            system_msg = f"You are a concise interviewer for role: {role}."
+        # Environment check
+        if not client and not _gemini_key:
+            return "Demo Mode: AI Service Unavailable (No Keys)."
+
+        # Set system prompt
+        system_msg = f"You are a helpful assistant. Role: {role}"
+        if task_type == "refine_bio":
+            system_msg = "You are a Resume Editor. Reformat the bio to be professional, grammatically correct and confident. RULES: Max 40 words. NO markdown. NO explanations."
         elif task_type == "improve_experience":
-            system_msg = "You are a Career Coach. Rewrite the input into a single powerful bullet point. Use an action verb; quantify when possible."
-        elif task_type == "refine_bio":
-            system_msg = "You are a Resume Editor. Reformat the bio to be professional and confident. Max 40 words. No markdown."
-        else:
-            system_msg = f"You are a helpful assistant. Role: {role}."
+            system_msg = "You are a Career Coach. Rewrite the input into a single powerful bullet point. RULES: Start with a strong Action Verb. Quantify results where possible. NO lists."
+        elif task_type == "mock_interview":
+            system_msg = f"You are a strict interviewer for a {role} role. Ask short, relevant questions."
+        elif task_type == "reformat_description":
+            system_msg = "You are a professional technical writer. Reformat the USER'S DESCRIPTION into a single clean formatted paragraph. Output ONLY the paragraph."
 
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": f"Input: {prompt}\n\nOutput:"}
+            {"role": "user", "content": f"Input: {safe_prompt}\nOutput:"}
         ]
 
-        raw = LLMEngine._call_llm(messages, max_tokens=600, temperature=0.15)
-        if not raw:
-            return "AI Service did not return a response."
-        return raw.strip()
+        raw = LLMEngine._call_llm(messages, max_tokens=300)
+        if raw is None:
+            return "AI Service Unavailable. Please try again."
 
-    # ------------------------
-    # Higher-level helpers (return dicts or empty dict on parse failure)
-    # ------------------------
-    def generate_initial_question(self, role: str, difficulty: str = "Medium", personality: str = "") -> Dict[str, Any]:
-        """
-        Ask LLM to provide a single JSON: { "question": "..." }
-        """
-        system_msg = f"You are an interviewer. {personality} Produce one clear interview question for role '{role}' at difficulty '{difficulty}'. Return JSON: {{ 'question': '...' }}"
+        return raw
 
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": "Return JSON only."}
-        ]
+    @staticmethod
+    def generate_resume(profile_data: Dict[str, Any], job_description: str, style: str = "modern") -> Dict[str, Any]:
+        """
+        Generates full resume JSON. Returns Mock data on failure.
+        """
+        if not client and not _gemini_key:
+            return LLMEngine._get_mock_resume()
 
-        raw = self._call_llm(messages, max_tokens=160, temperature=0.2)
-        parsed = self._safe_parse_json(raw)
-        if parsed and "question" in parsed:
-            return parsed
-        # also accept simple string (plain question)
-        if raw:
-            return {"question": raw.strip()}
-        return {}
-
-    def generate_next_question(self, role: str, difficulty: str, last_answer: Optional[str], personality: str = "") -> Dict[str, Any]:
-        """
-        Generate follow-up or next question. Return JSON { "question": "..." } or {}.
-        """
-        system_msg = f"You are an interviewer. {personality} Given role '{role}' and difficulty '{difficulty}', provide the next question. If last_answer exists, adapt the question as a follow-up. Return JSON: {{ 'question': '...' }}."
-        user_content = f"last_answer: {json.dumps(last_answer)}" if last_answer else "No last answer provided."
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_content}
-        ]
-        raw = self._call_llm(messages, max_tokens=200, temperature=0.25)
-        parsed = self._safe_parse_json(raw)
-        if parsed and "question" in parsed:
-            return parsed
-        if raw:
-            return {"question": raw.strip()}
-        return {}
-
-    def evaluate_answer(self, answer: str, question: str, role: str, personality: str = "", resume_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Ask the LLM to evaluate the answer. Expect JSON with keys:
-          score (0-100), feedback (str), strengths (list), weaknesses (list)
-        Returns parsed dict or {} if model didn't return parseable JSON.
-        """
-        system_msg = f"You are an interviewer & evaluator. {personality} Evaluate candidate's answer for role '{role}'. Prefer concise factual scoring."
-        user_prompt = (
-            f"Question: {question}\n"
-            f"Answer: {answer}\n\n"
-            "Return JSON: {\"score\": 0-100, \"feedback\":\"...\", \"strengths\": [..], \"weaknesses\": [..]}."
-        )
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_prompt}
-        ]
-        raw = self._call_llm(messages, max_tokens=300, temperature=0.15)
-        parsed = self._safe_parse_json(raw)
-        if parsed and "score" in parsed:
-            # coerce numeric types
-            try:
-                parsed["score"] = int(parsed["score"])
-            except Exception:
-                pass
-            return parsed
-        # As a helpful fallback, attempt to extract a simple numeric score in text
-        if raw:
-            # e.g., "Score: 72/100 — feedback..."
-            m = re.search(r"score[:\s]+(\d{1,3})", raw, re.IGNORECASE)
-            if m:
-                try:
-                    score = int(m.group(1))
-                    return {"score": score, "feedback": raw.strip(), "strengths": [], "weaknesses": []}
-                except Exception:
-                    pass
-        return {}
-
-    def improve_answer(self, answer: str, question: str, role: str, personality: str = "") -> Dict[str, Any]:
-        """
-        Request an improved/rewrite of the user's answer.
-        Returns { "improved_answer": "..." } or {}.
-        """
-        system_msg = f"You are an interviewer and writing coach. {personality} Rewrite the answer to be concise, impactful, and quantifying where reasonable. Return JSON: {{'improved_answer': '...'}}"
-        user_prompt = f"Question: {question}\nInput Answer: {answer}\nReturn JSON only."
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_prompt}
-        ]
-        raw = self._call_llm(messages, max_tokens=300, temperature=0.2)
-        parsed = self._safe_parse_json(raw)
-        if parsed and ("improved_answer" in parsed or "rewrite" in parsed or "rewrite_text" in parsed):
-            # normalize key
-            if "improved_answer" not in parsed:
-                for k in ("rewrite", "rewrite_text", "improved"):
-                    if k in parsed:
-                        parsed = {"improved_answer": parsed[k], **{x: parsed[x] for x in parsed if x not in (k,)}}
-                        break
-            return parsed
-        if raw:
-            return {"improved_answer": raw.strip()}
-        return {}
-
-    def generate_full_report(self, session: Dict, personality: str = "") -> Dict[str, Any]:
-        """
-        Ask the model to synthesize a full report for the entire session.
-        Expect JSON with keys:
-          overall_score, dimensions {communication, technical_depth, structure, confidence},
-          strengths, weaknesses, quick_wins (list of {title,description}), transcript (list)
-        Returns parsed dict or {}.
-        """
-        system_msg = f"You are an interviewer and analyst. {personality} Produce a JSON report summarizing the session with overall_score (0-100), dimensions, strengths, weaknesses, quick_wins, transcript."
-        # Truncate session for prompt safety
+        # Redact sensitive fields in profile_data (attempt structured redaction)
         try:
-            short_session = json.dumps(session, default=str)[:4000]
+            # Prefer structured redaction: redact typical keys if present
+            pd_copy = dict(profile_data) if isinstance(profile_data, dict) else {"profile": str(profile_data)}
+            for k in ("email", "phone", "contact"):
+                if k in pd_copy:
+                    pd_copy[k] = "[REDACTED]"
+            safe_profile_str = json.dumps(pd_copy, ensure_ascii=False)
         except Exception:
-            short_session = "{}"
-        user_prompt = f"Session: {short_session}\nReturn JSON only."
+            safe_profile_str = "{}"
 
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_prompt}
-        ]
-        raw = self._call_llm(messages, max_tokens=1200, temperature=0.15)
-        parsed = self._safe_parse_json(raw)
-        if parsed and "overall_score" in parsed:
-            return parsed
-        # fallback: if text contains something useful, return text in 'notes' to let caller fallback
-        if raw:
-            return {"notes": "LLM returned unparsable report; see raw_text", "raw_text": raw}
-        return {}
-
-    # Keep existing resume generator entrypoint from earlier file (optional)
-    def generate_resume(self, profile_data: dict, job_description: str, style: str = "modern") -> Dict[str, Any]:
-        """
-        High-level resume generation. Attempts Groq -> Gemini.
-        If unavailable, returns a small mock JSON.
-        """
         system_msg = (
             "You are an expert Resume Writer. Output strictly valid JSON. "
             "Do NOT include markdown formatting or code fences."
         )
+
         prompt = f"""
 REQUIRED STYLE: {style.upper()}
+- If 'MODERN': Concise, metric-heavy, active voice.
+- If 'PROFESSIONAL': Formal, traditional structure.
+
+Task 1: Write a professional resume tailored to the JD.
+Task 2: Provide 3 actionable tips.
+
 USER PROFILE:
-{json.dumps(profile_data)}
+{safe_profile_str}
+
 JOB DESCRIPTION:
-{job_description}
+{LLMEngine._truncate_input(job_description, max_chars=2000)}
+
 OUTPUT SCHEMA (JSON ONLY):
-{{ "resume_markdown": "...", "suggestions": ["..."] }}
+{{
+  "resume_markdown": "# Name...",
+  "suggestions": ["Tip 1", "Tip 2", "Tip 3"]
+}}
 """
-        messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}]
-        raw = self._call_llm(messages, max_tokens=1600, temperature=0.25)
-        parsed = self._safe_parse_json(raw)
-        if isinstance(parsed, dict):
-            return parsed
-        # try to extract {...}
-        if raw:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    return json.loads(raw[start:end+1])
-                except Exception:
-                    pass
-        # final mock fallback
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt}
+        ]
+
+        raw = LLMEngine._call_llm(messages, max_tokens=2500, temperature=0.3)
+        if raw is None:
+            logger.error("LLM providers failed for resume generation.")
+            return LLMEngine._get_mock_resume()
+
+        parsed = LLMEngine._safe_parse_json(raw)
+        validated = LLMEngine._validate_resume_schema(parsed)
+
+        # If we had to fall back to defaults, log diagnostic only if we had raw output
+        if (parsed is None) and raw:
+            logger.error("Resume parsing failed; returning validated defaults. Raw output length: %d", len(raw))
+
+        return validated
+
+    @staticmethod
+    def _get_mock_resume() -> Dict[str, Any]:
         return {
-            "resume_markdown": "# Mock Resume\n\nAI Service Unavailable.",
-            "suggestions": ["Check API Keys (GROQ_API_KEY, GEMINI_API_KEY)", "Restart backend after setting keys"]
+            "resume_markdown": "# Mock Resume\n\nAI Service Unavailable. Please check your API Keys or Network.",
+            "suggestions": ["Check backend logs.", "Ensure GROQ_API_KEY is set."]
         }

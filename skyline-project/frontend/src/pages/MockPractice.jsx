@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import toast from "react-hot-toast";
+import { FaHistory } from 'react-icons/fa';
 import ChatTimeline from "../components/mock/ChatTimeline";
 import SidebarStatus from "../components/mock/SidebarStatus";
 import AnswerBar from "../components/mock/AnswerBar";
 import TypingIndicator from "../components/mock/TypingIndicator";
 import MockResult from "../components/mock/MockResult";
+import MockHistory from "../components/mock/MockHistory"; // <--- Import
 import CodeEditorPanel from "../components/mock/CodeEditorPanel";
 import "../components/mock/mock_result.css";
 
@@ -72,10 +74,8 @@ function MockPractice() {
     pushMessage({ id: Date.now(), type: "user", text: finalAnswer });
     setIsLoading(true);
     
-    // --- RESET EDITOR STATE ---
     setCode(""); 
     setShowCode(false); 
-    // --------------------------
     
     try {
       const res = await axios.post("/mock-v3/submit-answer", {
@@ -118,7 +118,17 @@ function MockPractice() {
   if (mode === "setup") {
       return (
           <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
-              <div className="bg-white p-10 rounded-xl shadow-lg w-full max-w-lg">
+              <div className="bg-white p-10 rounded-xl shadow-lg w-full max-w-lg relative">
+                  
+                  {/* HISTORY BUTTON */}
+                  <button 
+                    onClick={() => setMode("history")}
+                    className="absolute top-6 right-6 text-gray-400 hover:text-indigo-600 transition"
+                    title="View Past Sessions"
+                  >
+                    <FaHistory size={20} />
+                  </button>
+
                   <h2 className="text-3xl font-bold mb-6 text-gray-800">Mock Interview Setup</h2>
                   <div className="space-y-4">
                     <div>
@@ -165,6 +175,28 @@ function MockPractice() {
               </div>
           </div>
       );
+  }
+
+  // --- NEW: HISTORY MODE ---
+  if (mode === "history") {
+    return (
+      <MockHistory 
+        onBack={() => setMode("setup")} 
+        onViewSession={(sid) => {
+          setSessionId(sid);
+          setMode("analyzing"); 
+          axios.get(`/mock-v3/${sid}/results`)
+            .then(res => {
+              setReport(res.data.data);
+              setMode("result");
+            })
+            .catch(() => {
+              toast.error("Could not load session.");
+              setMode("history");
+            });
+        }}
+      />
+    );
   }
   
   if (mode === "intro") {
