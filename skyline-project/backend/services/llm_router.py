@@ -24,19 +24,29 @@ settings = get_settings()
 # Internal Helpers
 # ----------------------------
 def _clean_text(raw: str) -> str:
+    """
+    Safely removes markdown code fences without deleting internal code blocks.
+    """
     if not raw: return ""
-    # Strip markdown blocks if they wrap the whole content
     clean = raw.strip()
-    if clean.startswith("```json"):
-        clean = clean[7:]
+    
+    # Remove opening fence (handle ```json, ```xml, etc.)
     if clean.startswith("```"):
-        clean = clean[3:]
+        # Find the first newline to skip the language identifier
+        newline_index = clean.find("\n")
+        if newline_index != -1:
+            clean = clean[newline_index+1:]
+        else:
+            # If no newline, just strip the first 3 chars
+            clean = clean[3:]
+            
+    # Remove closing fence
     if clean.endswith("```"):
         clean = clean[:-3]
+        
     return clean.strip()
 
 def _normalize_dimensions(dims: Dict[str, Any]) -> Dict[str, int]:
-    """Ensures scores are 0-100 integers."""
     cleaned = {}
     for key, val in dims.items():
         clean_key = key.replace("_", " ").title()
@@ -52,36 +62,52 @@ def _normalize_dimensions(dims: Dict[str, Any]) -> Dict[str, int]:
 def _simple_evaluate_answer(answer: str) -> Dict[str, Any]:
     """Fallback deterministic evaluator."""
     if not answer: return {"score": 0, "feedback": "No answer provided.", "metrics": {}}
+    
     word_count = len(answer.split())
     score = min(100, int(word_count * 1.5))
+    
+    # Check for code indicators
+    is_code = any(c in answer for c in ["function", "=>", "class", "def ", "{", "}"])
+    
+    suggestion = "AI unavailable."
+    if is_code:
+        suggestion += " Your code logic seems to be on the right track, but ensure you handle edge cases."
+    else:
+        suggestion += " Ensure your answer follows the STAR method (Situation, Task, Action, Result)."
+
     return {
         "score": score,
         "feedback": f"Deterministic Score: {score}/100 based on length ({word_count} words).",
-        "suggested_rewrite": "AI unavailable. Ensure your answer follows the STAR method.",
+        "suggested_rewrite": suggestion,
         "strengths": [],
         "weaknesses": []
     }
 
 def _parse_evaluation_text(raw: str) -> Optional[Dict[str, Any]]:
-    """Robust parser: Tries JSON first, then Regex."""
+    """Robust parser: Tries JSON extraction using brace matching."""
     if not raw: return None
     
-    # 1. Try Direct JSON Parse
+    cleaned = _clean_text(raw)
+    
+    # Strategy 1: Find outer braces to handle pre/post-amble text
     try:
-        clean = _clean_text(raw)
-        data = json.loads(clean)
-        return {
-            "score": int(data.get("score", 0)),
-            "feedback": data.get("feedback", ""),
-            "suggested_rewrite": data.get("suggested_rewrite") or data.get("improved_answer") or "",
-            "strengths": data.get("strengths", []),
-            "weaknesses": data.get("weaknesses", [])
-        }
-    except Exception:
-        pass
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1:
+            json_str = cleaned[start:end+1]
+            data = json.loads(json_str)
+            return {
+                "score": int(data.get("score", 0)),
+                "feedback": data.get("feedback", ""),
+                "suggested_rewrite": data.get("suggested_rewrite") or data.get("improved_answer") or "",
+                "strengths": data.get("strengths", []),
+                "weaknesses": data.get("weaknesses", [])
+            }
+    except Exception as e:
+        logger.warning(f"JSON Parse Failed: {e} | Raw partial: {cleaned[:100]}")
 
-    # 2. Fallback Regex
-    text = _clean_text(raw)
+    # Strategy 2: Fallback Regex
+    text = cleaned
     score_m = re.search(r"Score[:\s]*([0-9]{1,3})", text)
     score = int(score_m.group(1)) if score_m else 0
     feedback_m = re.search(r"Feedback[:\s]*\n?(.+)$", text, flags=re.DOTALL)
@@ -115,7 +141,8 @@ def ask_question(role: str = "general", difficulty: str = "Medium", type_: str =
         "Mixed": "Mix technical and behavioral."
     }
     
-    system_msg = f"You are a {personality} interviewer for a '{role}' role. {tone_map.get(personality, '')} {type_map.get(type_, '')} Ask a {difficulty} level question."
+    # Force concise output to prevent "Here is a question:" prefixes
+    system_msg = f"You are a {personality} interviewer for a '{role}' role. {tone_map.get(personality, '')} {type_map.get(type_, '')} Ask a {difficulty} level question. Output JUST the question text."
     
     try:
         client = getattr(llm_engine, "client", None)
@@ -137,18 +164,19 @@ def ask_question(role: str = "general", difficulty: str = "Medium", type_: str =
 
 def evaluate_answer(question: str, answer: str, role: str = "general", type_: str = "Mixed", personality: str = "Professional") -> Dict[str, Any]:
     """
-    Evaluates answer AGAINST the specific question.
+    Evaluates answer and FORCEFULLY requests a 'suggested_rewrite' JSON field.
     """
     system_msg = f"You are a {personality} interviewer for a {role} role."
     
+    # Updated Prompt: explicitly handles code
     user_content = (
         f"Question: \"{question}\"\n"
         f"Candidate Answer: \"{answer}\"\n\n"
-        "Task: Evaluate relevance, correctness, and depth.\n"
+        "Task: Evaluate correctness and depth. If code is involved, check for bugs.\n"
         "Return valid JSON:\n"
         "1. score (0-100)\n"
-        "2. feedback (Did they answer THE question?)\n"
-        "3. suggested_rewrite (Correct answer)\n"
+        "2. feedback (Critique based on your persona)\n"
+        "3. suggested_rewrite (Correct answer or better code implementation)\n"
         "4. strengths (list)\n"
         "5. weaknesses (list)"
     )
@@ -162,7 +190,8 @@ def evaluate_answer(question: str, answer: str, role: str = "general", type_: st
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_content}],
                 temperature=0.1, response_format={"type": "json_object"}
             )
-            parsed = _parse_evaluation_text(resp.choices[0].message.content)
+            raw_text = resp.choices[0].message.content
+            parsed = _parse_evaluation_text(raw_text)
             if parsed: return {"ok": True, "provider": "groq", "evaluation": parsed}
     except Exception as e:
         logger.error(f"Eval failed: {e}")
@@ -193,9 +222,13 @@ def generate_final_report(role: str, transcript: str) -> Dict[str, Any]:
             )
             raw = resp.choices[0].message.content
             clean = _clean_text(raw)
-            data = json.loads(clean)
-            data["dimensions"] = _normalize_dimensions(data.get("dimensions", {}))
-            return data
+            # Use bracket finding for report as well
+            start = clean.find("{")
+            end = clean.rfind("}")
+            if start != -1 and end != -1:
+                data = json.loads(clean[start:end+1])
+                data["dimensions"] = _normalize_dimensions(data.get("dimensions", {}))
+                return data
             
     except Exception as e:
         logger.error(f"Report Gen Failed: {e}")
